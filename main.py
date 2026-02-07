@@ -1597,8 +1597,175 @@ def health():
 def api_templates():
     templates_list = []
     for k, v in TEMPLATES.items():
-        templates_list.append({"key": k, "label": v["label"], "keywords": v["keywords"], "fields": v["fields"]})
-    return jsonify({"templates": templates_list})
+        templates_list.append({
+            "key": k, 
+            "label": v["label"], 
+            "keywords": v.get("keywords", []), 
+            "fields": v["fields"],
+            "dependencies": v.get("dependencies", []),
+            "references": v.get("references", {})
+        })
+    return jsonify(templates_list)
+
+
+@app.route("/api/tenant-data/search", methods=["GET"])
+def api_search_tenant_data():
+    """
+    Search and filter tenant data.
+    Params:
+      - tenantId (optional, defaults to demo-tenant if not in header/param, but let's say query param for now)
+      - template (optional): filter by templateKey (e.g. 'Bookings')
+      - q (optional): text search across all fields
+      - status (optional): filter by status field if it exists
+      - limit (optional): max records
+      - skip (optional): pagination
+    """
+    # For POC, just grab generic tenant
+    tenant_id = request.args.get("tenantId", "demo-tenant")
+    template_key = request.args.get("template")
+    query_text = request.args.get("q", "").strip()
+    status_filter = request.args.get("status")
+    
+    limit = int(request.args.get("limit", 50))
+    skip = int(request.args.get("skip", 0))
+
+    coll = get_tenant_data_collection()
+    if coll is None:
+        return jsonify({"error": "DB not connected"}), 500
+
+    # Build Mongo Query
+    mongo_query = {"tenantId": tenant_id}
+    
+    if template_key:
+        mongo_query["templateKey"] = template_key
+
+    # Search logic (Text)
+    if query_text:
+        regex = {"$regex": query_text, "$options": "i"}
+        if template_key == "Bookings":
+             mongo_query["$or"] = [
+                 {"data.bookingRef": regex},
+                 {"data.assessmentName": regex},
+                 {"data.providerName": regex},
+                 {"data.locationName": regex},
+                 {"data._parentRef_personNumber.label": regex}
+             ]
+        elif template_key == "People":
+             mongo_query["$or"] = [
+                 {"data.firstName": regex},
+                 {"data.surname": regex},
+                 {"data.email": regex},
+                 {"data.id": regex},
+             ]
+        else:
+             pass
+
+    # Generic Field Filtering (e.g. &status=Pending -> data.status=Pending)
+    # We iterate over all args and if they match a known field in the template (or just generic data param), we add it.
+    # To be safe, we'll look for arguments that are NOT the standard ones.
+    reserved_args = {"tenantId", "template", "q", "limit", "skip"}
+    
+    for k, v in request.args.items():
+        if k not in reserved_args and v:
+            # Assume it's a data field filter
+            # We treat numeric strings as likely numbers if the schema says so, but for now strict string match or simple conversion?
+            # Mongo finds are type-sensitive.
+            
+            # Special handling: if value looks like integer, try matching both string and int?
+            # or just rely on what's in DB.
+            
+            if v.lower() == "true":
+                val = True
+            elif v.lower() == "false":
+                val = False
+            elif v.isdigit():
+                 # Match string OR number for robustness
+                 val = {"$in": [v, int(v)]}
+            else:
+                 val = v
+            
+            mongo_query[f"data.{k}"] = val
+
+    total_count = coll.count_documents(mongo_query)
+    
+    cursor = coll.find(mongo_query).sort("timestamp", -1).skip(skip).limit(limit)
+    
+    results = []
+    for doc in cursor:
+        item = doc.get("data", {})
+        item["_id"] = str(doc["_id"])
+        item["_templateKey"] = doc.get("templateKey")
+        item["_createdAt"] = doc.get("timestamp")
+        results.append(item)
+
+    # --- Child Record Lookahead ---
+    # optimization: check if any other templates reference this one.
+    # If so, count how many children each result item has.
+    
+    # 1. Identify child templates and their join fields
+    child_refs = []
+    for t_key, t_def in TEMPLATES.items():
+        refs = t_def.get("references", {})
+        for ref_field, ref_cfg in refs.items():
+             if ref_cfg.get("targetTemplate") == template_key:
+                 child_refs.append({
+                     "childTemplate": t_key,
+                     "childRefField": ref_field, # e.g. personNumber
+                     "parentTargetField": ref_cfg.get("targetField") # e.g. id
+                 })
+    
+    if child_refs and results:
+        # 2. For each child relation, agg count
+        for cr in child_refs:
+            parent_field = cr["parentTargetField"]
+            
+            # Collect all IDs from the current result page
+            parent_ids = set()
+            for r in results:
+                val = r.get(parent_field)
+                if val:
+                    parent_ids.add(val)
+            
+            if not parent_ids:
+                continue
+
+            # Aggregation: Match specific children, Group by ref field
+            pipeline = [
+                {
+                    "$match": {
+                        "tenantId": tenant_id,
+                        "templateKey": cr["childTemplate"],
+                        f"data.{cr['childRefField']}": {"$in": list(parent_ids)}
+                    }
+                },
+                {
+                    "$group": {
+                        "_id": f"$data.{cr['childRefField']}",
+                        "count": {"$sum": 1}
+                    }
+                }
+            ]
+            
+            agg_res = list(coll.aggregate(pipeline))
+            
+            # Map counts back to results
+            count_map = {str(item["_id"]): item["count"] for item in agg_res}
+            
+            for r in results:
+                p_val = str(r.get(parent_field))
+                if p_val in count_map:
+                    if "_childCounts" not in r:
+                        r["_childCounts"] = {}
+                    r["_childCounts"][cr["childTemplate"]] = count_map[p_val]
+
+    return jsonify({
+        "data": results,
+        "meta": {
+            "total": total_count,
+            "limit": limit,
+            "skip": skip
+        }
+    })
 
 
 # --- Header mapping (rule-based) -------------------------------------------
