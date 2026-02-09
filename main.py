@@ -17,6 +17,9 @@ import json
 import re
 import csv
 from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv()
 
 import requests
 from flask import Flask, request, jsonify
@@ -1219,7 +1222,10 @@ def call_openai_chat(prompt: str, call_type: str, tenant_id: str = None, job_id:
     Returns (parsed_json, usage_dict) or (None, None) on error.
     """
     if not OPENAI_API_KEY:
+        print("DEBUG: call_openai_chat: No OPENAI_API_KEY set.")
         return None, None
+    
+    print(f"DEBUG: call_openai_chat: Sending request to OpenAI... (Key length: {len(OPENAI_API_KEY)})")
 
     try:
         resp = requests.post(
@@ -1247,41 +1253,35 @@ def call_openai_chat(prompt: str, call_type: str, tenant_id: str = None, job_id:
             },
             timeout=30,
         )
-        print(f"--- OpenAI Request ({call_type}) ---")
-        print(f"Model: {OPENAI_MODEL}")
-        print(f"Tenant: {tenant_id}")
-        # Not logging full prompt to avoid cluttering unless needed, but logging length
-        print(f"Prompt Length: {len(prompt)}")
+        if resp.status_code != 200:
+            print(f"DEBUG: OpenAI API Error: {resp.status_code} - {resp.text}")
+            return None, None
+
+        resp_json = resp.json()
+        content = resp_json["choices"][0]["message"]["content"]
+        # usage
+        usage = resp_json.get("usage", {})
+
+        # Attempt to parse JSON from content
+        # It might be wrapped in ```json ... ```
+        cleaned = content.strip()
+        if cleaned.startswith("```"):
+            import re
+            match = re.search(r"```(?:json)?(.*?)```", cleaned, re.DOTALL)
+            if match:
+                cleaned = match.group(1).strip()
+        
+        try:
+            parsed = json.loads(cleaned)
+            return parsed, usage
+        except json.JSONDecodeError as e:
+            print(f"DEBUG: JSON Parsing Failed: {e}")
+            print(f"DEBUG: Failed content: {cleaned}")
+            return None, usage
+
     except Exception as ex:
-        print(f"OpenAI HTTP error ({call_type}): {ex}")
+        print(f"DEBUG: call_openai_chat Exception: {ex}")
         return None, None
-
-    if resp.status_code != 200:
-        print(f"!!! OpenAI non-200 ({call_type}) !!!")
-        print(f"Status Code: {resp.status_code}")
-        print(f"Response Body: {resp.text[:1000]}") # Increased to see full error usually
-        return None, None
-
-    try:
-        data = resp.json()
-    except Exception as ex:
-        print(f"OpenAI JSON parse error ({call_type}): {ex}")
-        return None, None
-
-    content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
-    content = _strip_code_fences(content)
-    
-    print(f"--- OpenAI Response ({call_type}) ---")
-    print(f"Content: {content[:1000]}") # Log first 1000 chars of response
-
-    try:
-        parsed = json.loads(content)
-    except Exception as ex:
-        print(f"OpenAI result not valid JSON ({call_type}): {ex} | raw={content[:300]}")
-        parsed = None
-
-    usage = data.get("usage") or {}
-    return parsed, usage
 
 
 # --------------------------------------------------------------------------
@@ -2017,7 +2017,7 @@ def api_header_mapping():
 
 
 @app.route("/api/import/ai/detect-and-map", methods=["POST"])
-@app.route("/api/import/ai/detect-and-map", methods=["POST"])
+
 def api_ai_detect_and_map():
     data = request.get_json(force=True, silent=False) or {}
     uploaded_headers = data.get("uploadedHeaders") or data.get("headers") or []
@@ -2067,6 +2067,11 @@ def api_ai_detect_and_map():
             template_fields.append(field_obj)
 
         # Run mapping
+        # 0. Rule-Based Fallback (always compute)
+        rule_mappings = suggest_header_mappings(template_key, uploaded_headers, current_mapping={})
+        rule_by_key = {m["templateKey"]: m for m in rule_mappings}
+
+        # 1. AI Mapping (optional)
         prompt = build_header_prompt(
             template_key=template_key,
             uploaded_headers=uploaded_headers,
@@ -2086,15 +2091,54 @@ def api_ai_detect_and_map():
             total_completion_tokens += usage.get("completion_tokens", 0)
             total_estimated_cost += estimate_cost_from_usage(usage)
 
-        # Process Mapping Results
+        # 2. Merge AI & Rule-Based
         final_mappings = []
+        
+        # Helper to get AI confidence/match
+        ai_matches = {}
         if parsed and isinstance(parsed, dict) and isinstance(parsed.get("mappings"), list):
-            parsed_list = parsed["mappings"]
-            for field in tpl["fields"]:
-                fk = field["key"]
-                ai_item = next((m for m in parsed_list if m.get("templateKey") == fk), None)
-                if ai_item:
-                    final_mappings.append(ai_item)
+            for m in parsed["mappings"]:
+                 if m.get("templateKey"):
+                     ai_matches[m["templateKey"]] = m
+
+        used_headers = set()
+        
+        for field in tpl["fields"]:
+            fk = field["key"]
+            
+            # AI Suggestion
+            ai_item = ai_matches.get(fk)
+            matched = ai_item.get("matchedHeader") if ai_item else None
+            conf = float(ai_item.get("confidence", 0.0)) if ai_item else 0.0
+            
+            # Validation: must be in uploaded_headers
+            if matched not in uploaded_headers:
+                matched = None
+                conf = 0.0
+            
+            # Validation: must be unique
+            if matched and matched in used_headers:
+                matched = None
+                conf = 0.0
+            
+            # Fallback to Rule if AI is weak/missing
+            rule_m = rule_by_key.get(fk)
+            if (not matched or conf < 0.5) and rule_m and rule_m.get("matchedHeader"):
+                matched = rule_m["matchedHeader"]
+                conf = max(conf, float(rule_m.get("confidence", 0.0)))
+                source = "rule-fallback"
+            else:
+                source = "ai" if matched else "ai-none"
+            
+            if matched:
+                used_headers.add(matched)
+                
+            final_mappings.append({
+                "templateKey": fk, 
+                "matchedHeader": matched, 
+                "confidence": conf, 
+                "source": source
+            })
 
         results_by_template[template_key] = {
             "templateKey": template_key,
@@ -2432,6 +2476,54 @@ def api_import_trigger_job():
     })
 
 
+@app.route("/api/data/search", methods=["GET"])
+def api_search_data():
+    """Keyed search + pagination for large datasets."""
+    tenant_id = request.args.get("tenantId")
+    template_key = request.args.get("templateKey")
+    try:
+        limit = int(request.args.get("limit", 50))
+        skip = int(request.args.get("skip", 0))
+    except ValueError:
+        limit = 50
+        skip = 0
+
+    if not tenant_id:
+        return jsonify({"error": "tenantId is required"}), 400
+
+    coll_data = get_tenant_data_collection()
+    if coll_data is None:
+        return jsonify({"error": "MongoDB not connected"}), 500
+
+    query = {"tenantId": tenant_id}
+    if template_key:
+        query["templateKey"] = template_key
+
+    total = coll_data.count_documents(query)
+    cursor = coll_data.find(query).sort("timestamp", -1).skip(skip).limit(limit)
+
+    results = []
+    for doc in cursor:
+        ts = doc.get("timestamp")
+        if isinstance(ts, datetime):
+            ts = ts.isoformat()
+        
+        results.append({
+            "id": str(doc["_id"]),
+            "data": doc.get("data", {}),
+            "timestamp": ts,
+            "templateKey": doc.get("templateKey", ""),
+            "__operation": doc.get("__operation", "")
+        })
+
+    return jsonify({
+        "data": results,
+        "total": total,
+        "page": (skip // limit) + 1,
+        "limit": limit
+    })
+
+
 @app.route("/api/data", methods=["GET"])
 def api_get_data():
     """Retrieve saved data for a tenant."""
@@ -2484,38 +2576,58 @@ def api_get_data():
         for r in job_records:
             # PREFER SNAPSHOT: If processedData exists (new jobs), use it directly.
             if "processedData" in r:
+                print(f"DEBUG: Using processedData snapshot for record {r.get('_id')}")
+                processed_data = r["processedData"]
+                # Extract __operation from snapshot data
+                operation = processed_data.get("__operation", "")
+                # Remove __operation from data to keep it clean
+                data_without_operation = {k: v for k, v in processed_data.items() if k != "__operation"}
+                
                 snapshot_results.append({
                     "id": str(r["_id"]), # Use record ID as the row ID for history view
-                    "data": r["processedData"],
+                    "data": data_without_operation,
                     "timestamp": datetime.utcnow().isoformat(), # approximate or fetch from record if we stored it
-                    "templateKey": r.get("templateKey", "")
+                    "templateKey": r.get("templateKey", ""),
+                    "__operation": operation
                 })
             else:
                 # FALLBACK (Old Jobs): Use current state from tenant_data via ID match
                 d = r.get("data", {})
+                print(f"DEBUG: Record data keys: {d.keys()}, has 'id': {'id' in d}")
                 if "id" in d:
                     target_ids.append(d["id"])
+        
+        print(f"DEBUG: snapshot_results count: {len(snapshot_results)}, target_ids count: {len(target_ids)}")
         
         # If we found snapshots, return them mixed with any lookups (though usually it's one or the other per job)
         if snapshot_results:
             # If we also have target_ids (hybrid? unlikely), we could fetch them too, 
             # but let's assume if snapshots exist, they cover the job.
             # Actually, to be safe, let's include both if mixed.
+            print(f"DEBUG: Returning snapshot results")
             results.extend(snapshot_results)
         
         if target_ids:
             # Fetch current state of these records from tenant_data
             # We match on data.id
             query["data.id"] = {"$in": target_ids}
+            print(f"DEBUG: Fetching data with query: {query}")
+            print(f"DEBUG: Target IDs: {target_ids}")
             cursor = coll_data.find(query).limit(100)
             
             for doc in cursor:
+                print(f"DEBUG: Document __operation field: {doc.get('__operation', 'NOT FOUND')}")
                 results.append({
                     "id": str(doc["_id"]),
                     "data": doc["data"],
                     "timestamp": doc["timestamp"].isoformat() if isinstance(doc["timestamp"], datetime) else doc["timestamp"],
-                    "templateKey": doc["templateKey"]
+                    "templateKey": doc["templateKey"],
+                    "__operation": doc.get("__operation", "")
                 })
+        
+        print(f"DEBUG: Returning {len(results)} results")
+        if results:
+            print(f"DEBUG: First result __operation: {results[0].get('__operation', 'NOT FOUND')}")
         
         return jsonify({"data": results})
 
@@ -2529,7 +2641,8 @@ def api_get_data():
             "id": str(doc["_id"]),
             "data": doc["data"],
             "timestamp": doc["timestamp"].isoformat() if isinstance(doc["timestamp"], datetime) else doc["timestamp"],
-            "templateKey": doc["templateKey"]
+            "templateKey": doc["templateKey"],
+            "__operation": doc.get("__operation", "")
         })
 
     return jsonify({"data": results})
@@ -2658,6 +2771,15 @@ def process_ingestion_jobs():
                 
                 any_error = False
                 
+                # Initialize granular metrics
+                job_metrics = {
+                    "totalRecords": 0,
+                    "created": 0,
+                    "updated": 0,
+                    "errors": 0,
+                    "byTemplate": {}
+                }
+                
                 # Process strictly in plan order
                 for stage in execution_order: # e.g. "People", "Bookings"
                     print(f"WORKER: Processing stage '{stage}' for Job {job_id}")
@@ -2679,10 +2801,20 @@ def process_ingestion_jobs():
                     if not tpl_def:
                         continue
 
+                    # Initialize template-specific metrics
+                    if template_key not in job_metrics["byTemplate"]:
+                        job_metrics["byTemplate"][template_key] = {
+                            "created": 0,
+                            "updated": 0,
+                            "errors": 0
+                        }
+
                     # Process records
                     records_cursor = coll_records.find({"jobId": job_id, "status": "pending"})
                     record_count = coll_records.count_documents({"jobId": job_id, "status": "pending"})
                     print(f"WORKER: Found {record_count} pending records for Job {job_id}")
+                    
+                    job_metrics["totalRecords"] += record_count
 
                     for rec in records_cursor:
                         try:
@@ -2711,7 +2843,7 @@ def process_ingestion_jobs():
                                             "label": f"{target_tpl} {source_val}" 
                                         }
 
-                            # 2. Upsert Logic
+                            # 2. Upsert Logic with tracking
                             primary_keys = [f["key"] for f in tpl_def["fields"] if f.get("identifier")]
                             query = {"tenantId": tenant_id, "templateKey": template_key}
                             
@@ -2723,7 +2855,10 @@ def process_ingestion_jobs():
                                         
                                 final_data = {**row_data, **resolved_links}
                                 
-                                coll_data.update_one(
+                                # Check if record exists before upsert
+                                existing = coll_data.find_one(query)
+                                
+                                result = coll_data.update_one(
                                     query,
                                     {"$set": {
                                         "data": final_data,
@@ -2732,24 +2867,52 @@ def process_ingestion_jobs():
                                     }},
                                     upsert=True
                                 )
-                                print(f"WORKER: Upserted record for {pk}={val}. JobID associated: {job_id}")
+                                
+                                # Track whether this was create or update
+                                if result.upserted_id:
+                                    job_metrics["created"] += 1
+                                    job_metrics["byTemplate"][template_key]["created"] += 1
+                                    action = "created"
+                                elif existing:
+                                    job_metrics["updated"] += 1
+                                    job_metrics["byTemplate"][template_key]["updated"] += 1
+                                    action = "updated"
+                                else:
+                                    # Edge case: matched but not updated
+                                    action = "matched"
+                                
+                                # Store operation metadata on the record
+                                print(f"WORKER: About to store __operation='{action}' for query: {query}")
+                                result2 = coll_data.update_one(
+                                    query,
+                                    {"$set": {"__operation": action}}
+                                )
+                                print(f"WORKER: Stored __operation. Matched: {result2.matched_count}, Modified: {result2.modified_count}")
+                                
+                                print(f"WORKER: {action.capitalize()} record for {pk}={val}. JobID: {job_id}")
                             else:
                                 final_data = {**row_data, **resolved_links}
+                                action = "created"  # Set action for insert path
                                 coll_data.insert_one({
                                     "tenantId": tenant_id,
                                     "templateKey": template_key,
                                     "data": final_data,
                                     "timestamp": datetime.now(),
-                                    "jobId": job_id
+                                    "jobId": job_id,
+                                    "__operation": action
                                 })
+                                job_metrics["created"] += 1
+                                job_metrics["byTemplate"][template_key]["created"] += 1
 
                             # 3. Mark Record Resolved AND Save Snapshot
+                            # Include __operation in snapshot
+                            snapshot_data = {**final_data, "__operation": action}
                             coll_records.update_one(
                                 {"_id": rec["_id"]}, 
                                 {
                                     "$set": {
                                         "status": "resolved",
-                                        "processedData": final_data
+                                        "processedData": snapshot_data
                                     }
                                 }
                             )
@@ -2760,15 +2923,22 @@ def process_ingestion_jobs():
                                 {"_id": rec["_id"]}, 
                                 {"$set": {"status": "error", "error": str(e)}}
                             )
+                            job_metrics["errors"] += 1
+                            job_metrics["byTemplate"][template_key]["errors"] += 1
                             any_error = True
 
-                # Job Complete
+                # Job Complete with metrics
                 final_status = "error" if any_error else "completed"
                 coll_jobs.update_one(
                     {"_id": job["_id"]}, 
-                    {"$set": {"status": final_status, "completedAt": datetime.now()}}
+                    {"$set": {
+                        "status": final_status, 
+                        "completedAt": datetime.now(),
+                        "metrics": job_metrics
+                    }}
                 )
                 print(f"WORKER: Job {job_id} finished with status {final_status}")
+                print(f"WORKER: Metrics - Created: {job_metrics['created']}, Updated: {job_metrics['updated']}, Errors: {job_metrics['errors']}")
 
             time.sleep(2) # Poll interval
             

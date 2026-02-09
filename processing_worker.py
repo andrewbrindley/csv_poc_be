@@ -1,6 +1,14 @@
 
+
 import threading
 import time
+from datetime import datetime
+from db_config import (
+    get_ingestion_jobs_collection,
+    get_ingestion_records_collection,
+    get_tenant_data_collection,
+    get_raw_uploads_collection
+)
 
 # --------------------------------------------------------------------------
 # Background Worker: Job Processing
@@ -163,7 +171,8 @@ def process_ingestion_jobs():
                                 # Merge links
                                 final_data = {**row_data, **resolved_links}
                                 
-                                coll_data.update_one(
+                                # Perform upsert and track operation type
+                                result = coll_data.update_one(
                                     query,
                                     {"$set": {
                                         "data": final_data,
@@ -171,6 +180,15 @@ def process_ingestion_jobs():
                                         "jobId": job_id
                                     }},
                                     upsert=True
+                                )
+                                
+                                # Track whether this was a create or update
+                                operation = "created" if result.upserted_id else "updated"
+                                
+                                # Update the record with operation metadata
+                                coll_data.update_one(
+                                    query,
+                                    {"$set": {"__operation": operation}}
                                 )
                             else:
                                 # No identifier? persistent append?
@@ -180,7 +198,8 @@ def process_ingestion_jobs():
                                     "templateKey": template_key,
                                     "data": final_data,
                                     "timestamp": datetime.now(),
-                                    "jobId": job_id
+                                    "jobId": job_id,
+                                    "__operation": "created"
                                 })
 
                             # 3. Mark Record Resolved
