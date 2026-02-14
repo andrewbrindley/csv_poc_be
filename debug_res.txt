@@ -1,0 +1,24 @@
+Requesting http://localhost:5000/api/tenant-data/search with params {'tenantId': 'acme-corp', 'templateKey': 'People', 'limit': 10}
+Status: 200
+Content: {
+  "data": [
+    {
+      "_createdAt": "Fri, 13 Feb 2026 00:14:21 GMT",
+      "_id": "698db993c775c161291d55ff",
+      "_templateKey": "People",
+      "dob": "01-01-2000",
+      "email": "blank.id@example.com",
+      "firstName": "Mr",
+      "gender": "M",
+      "id": "1009",
+      "surname": "Blankid",
+      "title": "Mr",
+      "type": "Candidate"
+    },
+    {
+      "_createdAt": "Fri, 13 Feb 2026 00:14:21 GMT",
+      "_id": "698db993c775c161291d55fe",
+      "_templateKey": "People",
+      "d...
+JSON Data Count: 10
+First Item: {'_createdAt': 'Fri, 13 Feb 2026 00:14:21 GMT', '_id': '698db993c775c161291d55ff', '_templateKey': 'People', 'dob': '01-01-2000', 'email': 'blank.id@example.com', 'firstName': 'Mr', 'gender': 'M', 'id': '1009', 'surname': 'Blankid', 'title': 'Mr', 'type': 'Candidate'}

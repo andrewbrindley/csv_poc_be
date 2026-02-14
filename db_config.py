@@ -67,7 +67,15 @@ def get_ingestion_jobs_collection():
     return None
 
 def get_ingestion_records_collection():
+    """Get the ingestion_records collection."""
     db = get_db()
-    if db is not None:
-        return db["ingestion_records"]
-    return None
+    if db is None:
+        return None
+    return db["ingestion_records"]
+
+def get_templates_collection():
+    """Get the templates collection for user-defined templates."""
+    db = get_db()
+    if db is None:
+        return None
+    return db["templates"]

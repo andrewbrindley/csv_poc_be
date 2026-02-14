@@ -27,12 +27,15 @@ from flask_cors import CORS
 import uuid
 import threading
 import time
+import hashlib
+import random
 from db_config import (
     get_imports_collection, 
     get_tenant_data_collection, 
     get_raw_uploads_collection, 
     get_ingestion_jobs_collection,
-    get_ingestion_records_collection
+    get_ingestion_records_collection,
+    get_templates_collection
 )
 
 # --------------------------------------------------------------------------
@@ -45,342 +48,61 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 app = Flask(__name__)
 CORS(app, supports_credentials=True, resources={r"/api/*": {"origins": "*"}})
 
+# Register REST API Blueprint
+try:
+    from api_data import data_bp
+    app.register_blueprint(data_bp, url_prefix="/api/v1")
+    print("Main: Registered data_bp at /api/v1")
+except Exception as e:
+    print(f"Main: Failed to register data_bp: {e}")
+
+# Register GraphQL Endpoint
+try:
+    from flask_graphql import GraphQLView
+    from schema_builder import schema
+    
+    # Custom View to inject tenant_id from query params into context
+    class CustomGraphQLView(GraphQLView):
+        def get_context(self):
+            # Return a dict so we can inject values. 
+            # info.context in resolvers will be this dict.
+            return {
+                'request': request,
+                'tenant_id': request.args.get('tenantId')
+            }
+
+    app.add_url_rule(
+        '/graphql',
+        view_func=CustomGraphQLView.as_view(
+            'graphql',
+            schema=schema,
+            graphiql=True # Enable GraphiQL interface
+        )
+    )
+    print("Main: Registered GraphQL at /graphql")
+except Exception as e:
+    print(f"Main: Failed to register GraphQL: {e}")
+
 # --------------------------------------------------------------------------
 # Template + field metadata (with PII flags + schema hints)
 # --------------------------------------------------------------------------
-PEOPLE_STATUSES = ["Candidate", "Employee"]
-BOOKING_STATUSES = ["Pending", "Booked", "Completed", "Cancelled"]
-PATIENT_STATUSES = ["Pending", "In Progress", "Completed", "Cancelled"]
-
-TEMPLATES = {
-    "People": {
-        "key": "People",
-        "label": "People (Candidates/Employees)",
-        "keywords": [
-            "firstname",
-            "surname",
-            "employee",
-            "candidate",
-            "dob",
-            "email",
-            "gender",
-        ],
-        "fields": [
-            {
-                "key": "type",
-                "label": "Type",
-                "required": True,
-                "allowed": PEOPLE_STATUSES,
-                "is_pii": False,
-                "identifier": False,
-                "synonyms": [
-                    "candidate type",
-                    "employee type",
-                    "person type",
-                    "role type",
-                ],
-                "pattern": "enum",
-                "description": "The category of the person record.",
-                "examples": ["Candidate", "Employee"],
-            },
-            {
-                "key": "id",
-                "label": "Candidate/Employee No",
-                "required": True,
-                "allowed": None,
-                "is_pii": True,
-                "identifier": True,
-                "synonyms": [
-                    "employee no",
-                    "employee number",
-                    "candidate number",
-                    "emp no",
-                    "emp#",
-                    "person id",
-                ],
-                "pattern": "integer",
-                "sequence": "+1",
-                "description": "The unique numeric identifier for the candidate or employee.",
-                "examples": ["1001", "54022", "883"],
-            },
-            {
-                "key": "title",
-                "label": "Title",
-                "required": True,
-                "allowed": ["Mr", "Ms", "Mrs", "Miss", "Dr"],
-                "is_pii": True,
-                "identifier": False,
-                "synonyms": ["salutation", "honorific"],
-                "normalize": "titlecase",
-                "description": "The person's salutation or title.",
-                "examples": ["Mr", "Mrs", "Dr", "Ms"],
-            },
-            {
-                "key": "firstName",
-                "label": "First Name",
-                "required": True,
-                "allowed": None,
-                "is_pii": True,
-                "identifier": False,
-                "synonyms": ["firstname", "given name", "forename", "name first"],
-                "normalize": "titlecase",
-                "description": "The person's given name.",
-                "examples": ["John", "Sarah", "Michael"],
-            },
-            {
-                "key": "surname",
-                "label": "Surname",
-                "required": True,
-                "allowed": None,
-                "is_pii": True,
-                "identifier": False,
-                "synonyms": ["last name", "family name", "lastname"],
-                "normalize": "titlecase",
-                "description": "The person's family name or surname.",
-                "examples": ["Smith", "Jones", "O'Connor"],
-            },
-            {
-                "key": "gender",
-                "label": "Gender",
-                "required": True,
-                "allowed": ["M", "F", "Male", "Female", "Other"],
-                "is_pii": True,
-                "identifier": False,
-                "synonyms": ["sex"],
-                "pattern": "enum",
-                "description": "The biological sex or gender identity.",
-                "examples": ["M", "F", "Male", "Female"],
-            },
-            {
-                "key": "dob",
-                "label": "DOB",
-                "required": True,
-                "allowed": None,
-                "is_pii": True,
-                "identifier": False,
-                "synonyms": ["date of birth", "birthdate", "birth date"],
-                "pattern": "date",
-                "dateFormat": "DD-MM-YYYY",
-                "description": "The person's date of birth.",
-                "examples": ["25-12-1980", "01-05-1995"],
-            },
-            {
-                "key": "email",
-                "label": "Email",
-                "required": True,
-                "allowed": None,
-                "is_pii": True,
-                "identifier": False,
-                "synonyms": ["email address", "e-mail", "mail"],
-                "pattern": "email",
-                "normalize": "email",
-                "description": "The person's contact email address.",
-                "examples": ["john.smith@example.com", "sarah.j@company.org"],
-            },
-        ],
-    },
-    "Bookings": {
-        "key": "Bookings",
-        "label": "Bookings (Assessment Appointments)",
-        "dependencies": ["People"],
-        "references": {
-            "personNumber": {"targetTemplate": "People", "targetField": "id"}
-        },
-        "keywords": [
-            "booking",
-            "appointment",
-            "assessment",
-            "date",
-            "time",
-            "location",
-            "clinic",
-            "provider",
-        ],
-        "fields": [
-            {
-                "key": "bookingRef",
-                "label": "Booking Reference",
-                "required": True,
-                "allowed": None,
-                "is_pii": False,
-                "identifier": True,
-                "synonyms": ["booking ref", "booking id", "appt ref", "reference", "ref"],
-                "pattern": "string",
-                "description": "Unique identifier for the booking appointment.",
-                "examples": ["BK-1001", "APT-992"],
-            },
-            {
-                "key": "personNumber",
-                "label": "Candidate/Employee No",
-                "required": True,
-                "allowed": None,
-                "is_pii": True,
-                "identifier": False,
-                "synonyms": [
-                    "employee no",
-                    "person no",
-                    "candidate no",
-                    "emp no",
-                    "emp#",
-                    "person id",
-                ],
-                "pattern": "integer",
-                "description": "Numeric ID of the person being assessed.",
-                "examples": ["1001", "54022"],
-            },
-            {
-                "key": "assessmentName",
-                "label": "Assessment Name",
-                "required": True,
-                "allowed": None,
-                "is_pii": False,
-                "identifier": False,
-                "synonyms": ["assessment", "exam name", "panel", "service"],
-                "normalize": "titlecase",
-                "description": "Text, Title Case",
-            },
-            {
-                "key": "assessmentDate",
-                "label": "Assessment Date",
-                "required": True,
-                "allowed": None,
-                "is_pii": False,
-                "identifier": False,
-                "synonyms": ["appt date", "booking date", "date"],
-                "pattern": "date",
-                "dateFormat": "DD-MM-YYYY",
-                "description": "The date the assessment took place.",
-                "examples": ["25-12-2025", "01-05-2026"],
-            },
-            {
-                "key": "locationName",
-                "label": "Location",
-                "required": True,
-                "allowed": None,
-                "is_pii": False,
-                "identifier": False,
-                "synonyms": ["clinic", "site", "venue", "location"],
-                "normalize": "titlecase",
-                "description": "Text, Title Case",
-            },
-            {
-                "key": "providerName",
-                "label": "Provider Name",
-                "required": True,
-                "allowed": None,
-                "is_pii": False,
-                "identifier": False,
-                "synonyms": ["provider", "doctor", "clinician", "supplier"],
-                "normalize": "titlecase",
-                "description": "Text, Title Case",
-            },
-            {
-                "key": "status",
-                "label": "Booking Status",
-                "required": False,
-                "allowed": BOOKING_STATUSES,
-                "is_pii": False,
-                "identifier": False,
-                "synonyms": ["status", "booking status", "appt status"],
-                "pattern": "enum",
-                "description": "The current status of the booking.",
-            },
-        ],
-    },
-    "PatientData": {
-        "key": "PatientData",
-        "label": "Patient Data",
-        "keywords": ["patient", "candidate", "employee", "assessment", "test", "block", "status", "notes"],
-        "fields": [
-            {
-                "key": "patientId",
-                "label": "Candidate/Employee No",
-                "required": True,
-                "allowed": None,
-                "is_pii": True,
-                "identifier": True,
-                "synonyms": [
-                    "employee no",
-                    "employee number",
-                    "candidate number",
-                    "patient number",
-                    "emp no",
-                    "emp#",
-                ],
-                "pattern": "integer",
-                "sequence": "+1",
-                "description": "Unique numeric ID for the patient.",
-                "examples": ["1001", "54022"],
-            },
-            {
-                "key": "assessmentName",
-                "label": "Assessment Name",
-                "required": True,
-                "allowed": None,
-                "is_pii": False,
-                "identifier": False,
-                "synonyms": ["assessment", "exam name", "panel", "service"],
-                "normalize": "titlecase",
-                "description": "Text, Title Case",
-            },
-            {
-                "key": "blockName",
-                "label": "Block",
-                "required": False,
-                "allowed": None,
-                "is_pii": False,
-                "identifier": False,
-                "synonyms": ["block", "panel", "stream", "section"],
-                "normalize": "titlecase",
-                "description": "The block or stream (optional).",
-                "examples": ["Block A", "Stream 1"],
-            },
-            {
-                "key": "tests",
-                "label": "Tests",
-                "required": True,
-                "allowed": None,
-                "is_pii": False,
-                "identifier": False,
-                "synonyms": ["tests", "test panel", "procedures", "services"],
-                "normalize": "titlecase",
-                "description": "Text, Title Case",
-            },
-            {
-                "key": "status",
-                "label": "Status",
-                "required": True,
-                "allowed": ["Pending", "In Progress", "Completed", "Cancelled"],
-                "is_pii": False,
-                "identifier": False,
-                "synonyms": ["status", "result status", "progress"],
-                "pattern": "enum",
-                "description": "The current status of the assessment.",
-            },
-            {
-                "key": "notes",
-                "label": "Clinical Notes",
-                "required": False,
-                "allowed": None,
-                "is_pii": True,
-                "identifier": False,
-                "synonyms": ["notes", "comments", "clinical notes", "remarks"],
-                "description": "Any clinical remarks or comments.",
-                "examples": ["Patient arrived late", "Requires follow-up"],
-            },
-        ],
-    },
-}
+from core_config import (
+    PEOPLE_STATUSES, 
+    BOOKING_STATUSES, 
+    PATIENT_STATUSES, 
+    TEMPLATES
+)
 
 
-def get_execution_order(template_keys: list) -> list:
+def get_execution_order(template_keys: list, all_templates: dict = None) -> list:
     """
     Return a topologically sorted list of template keys based on dependencies.
     Raises ValueError if a cycle is detected or dependency is missing.
     """
     # Build subgraph for just the requested keys + their ancestors
     # For now, we'll just build the graph for ALL templates to be safe/simple
-    graph = {k: set(v.get("dependencies", [])) for k, v in TEMPLATES.items()}
+    source = all_templates if all_templates is not None else TEMPLATES
+    graph = {k: set(v.get("dependencies", [])) for k, v in source.items()}
     
     # Filter graph to only include relevant nodes if we wanted, 
     # but for typical small N, full sort is fine.
@@ -426,26 +148,80 @@ def validate_template_dependencies():
     except Exception as e:
         print(f"!!! DAG VALIDATION FAILED: {e}")
 
-# Run validation immediately
+# Run validation immediately for static defaults
 validate_template_dependencies()
 
 
-def get_template(template_key: str):
-    """Look up a template by key or label, case-insensitive."""
+def get_templates(tenant_id: str = None) -> dict:
+    """
+    Fetch templates for tenant and merge with system defaults.
+    Returns dict: { 'TemplateKey': { ...template... }, ... }
+    """
+    # Start with a shallow copy of defaults
+    # Note: If we want tenants to completely OVERRIDE defaults, this is good.
+    # If we want to hide defaults, start with empty dict.
+    # For now, we assume defaults (People, Bookings) are always available unless overridden.
+    final_templates = TEMPLATES.copy()
+
+    if not tenant_id:
+        return final_templates
+
+    coll = get_templates_collection()
+    if coll is None:
+        return final_templates
+
+    try:
+        # Fetch all templates for this tenant
+        cursor = coll.find({"tenantId": tenant_id})
+        for doc in cursor:
+            # Helper to convert MongoDB doc to template dict
+            # We assume the doc structure matches the required template structure
+            # fields, key, label, keywords, etc.
+            t_key = doc.get("templateKey")
+            if not t_key:
+                continue
+            
+            # Clean up _id for pure dict usage if needed, or just pass it through
+            doc.pop("_id", None)
+            
+            # Allow overwriting default if key matches
+            # Ensure "key" field exists for backward compatibility
+            if "key" not in doc:
+                doc["key"] = t_key
+                
+            final_templates[t_key] = doc
+    except Exception as e:
+        print(f"Error fetching templates for tenant {tenant_id}: {e}")
+
+    return final_templates
+
+
+def get_template(template_key: str, all_templates: dict = None):
+    """
+    Look up a template by key or label, case-insensitive.
+    If all_templates provided, use it. Otherwise fall back to global TEMPLATES (legacy).
+    """
     if not template_key:
         raise ValueError("templateKey is required")
 
-    tpl = TEMPLATES.get(template_key)
+    source = all_templates if all_templates is not None else TEMPLATES
+
+    t_key_str = str(template_key)
+    tpl = source.get(t_key_str)
     if tpl:
         return tpl
 
-    key_lower = str(template_key).lower()
-    for k, v in TEMPLATES.items():
+    # Case-insensitive fallback
+    key_lower = t_key_str.lower()
+    for k, v in source.items():
         if k.lower() == key_lower:
             return v
 
-    for _k, v in TEMPLATES.items():
-        if v["label"].lower() == key_lower:
+    # Label fallback
+    for _k, v in source.items():
+        if v.get("label", "").lower() == key_lower:
+            return v
+        if v.get("templateLabel", "").lower() == key_lower: 
             return v
 
     raise ValueError(f"Unknown templateKey: {template_key}")
@@ -808,7 +584,7 @@ def clean_value(template_key: str, field: dict, raw):
     return clean_val, status
 
 
-def infer_sequential_numeric_ids(template_key: str, rows: list):
+def infer_sequential_numeric_ids(template_key: str, rows: list, all_templates: dict = None):
     """
     Fill single obvious numeric ID gaps algorithmically.
     Uses fields tagged identifier=True.
@@ -816,7 +592,7 @@ def infer_sequential_numeric_ids(template_key: str, rows: list):
     Returns list of:
     { "rowIndex": int, "fieldKey": str, "newValue": str, "reason": str }
     """
-    tpl = get_template(template_key)
+    tpl = get_template(template_key, all_templates)
     id_fields = [f["key"] for f in tpl["fields"] if f.get("identifier")]
     inferred = []
 
@@ -891,7 +667,7 @@ def infer_sequential_numeric_ids(template_key: str, rows: list):
     return inferred
 
 
-def clean_rows_for_template(template_key: str, rows: list):
+def clean_rows_for_template(template_key: str, rows: list, all_templates: dict = None):
     """
     Algorithmically clean + validate all rows for a given template.
 
@@ -902,7 +678,7 @@ def clean_rows_for_template(template_key: str, rows: list):
       row_errors: dict[rowIndex -> list[fieldKey]]
       inferred_ids: list[...]
     """
-    tpl = get_template(template_key)
+    tpl = get_template(template_key, all_templates)
     cleaned_rows = []
     row_errors = {}
 
@@ -935,14 +711,14 @@ def clean_rows_for_template(template_key: str, rows: list):
 
         cleaned_rows.append(cleaned)
 
-    inferred_ids = infer_sequential_numeric_ids(template_key, cleaned_rows)
+    inferred_ids = infer_sequential_numeric_ids(template_key, cleaned_rows, all_templates)
     return cleaned_rows, row_errors, inferred_ids
 
 
 # --------------------------------------------------------------------------
 # Header mapping helpers
 # --------------------------------------------------------------------------
-def compute_header_score(field: dict, header: str) -> float:
+def compute_header_score(field: dict, header: str, all_templates: dict = None) -> float:
     """Heuristic score for mapping a given uploaded header to a template field."""
     if not header:
         return 0.0
@@ -972,19 +748,25 @@ def compute_header_score(field: dict, header: str) -> float:
             score += 4.0
 
     # small boost based on template keywords
-    for kw in get_template(field["templateKey"])["keywords"]:
-        if kw in hl:
-            score += 1.5
+    # If all_templates is not provided, it falls back to global TEMPLATES in get_template
+    try:
+        kw_list = get_template(field["templateKey"], all_templates)["keywords"]
+        for kw in kw_list:
+            if kw in hl:
+                score += 1.5
+    except ValueError:
+        # If template not found (e.g. race condition or bad key), ignore keyword boost
+        pass
 
     return score
 
 
-def suggest_header_mappings(template_key: str, uploaded_headers: list, current_mapping: dict):
+def suggest_header_mappings(template_key: str, uploaded_headers: list, current_mapping: dict, all_templates: dict = None):
     """
     Pure rule-based header mapping suggestion.
     Returns list of {templateKey, matchedHeader, confidence, source}.
     """
-    tpl = get_template(template_key)
+    tpl = get_template(template_key, all_templates)
     current_mapping = current_mapping or {}
     used_headers = set(h for h in current_mapping.values() if h)
     mappings = []
@@ -1008,7 +790,7 @@ def suggest_header_mappings(template_key: str, uploaded_headers: list, current_m
         for h in uploaded_headers:
             if h in used_headers:
                 continue
-            score = compute_header_score(enriched_field, h)
+            score = compute_header_score(enriched_field, h, all_templates)
             if score > best_score:
                 best_score = score
                 best_header = h
@@ -1023,14 +805,17 @@ def suggest_header_mappings(template_key: str, uploaded_headers: list, current_m
     return mappings
 
 
-def detect_template_from_headers(headers: list) -> str:
+def detect_template_from_headers(headers: list, all_templates: dict = None) -> str:
     """Lightweight heuristic to pick the most likely template based on headers."""
     detected_key = None
     best_score = 0
+    
+    source = all_templates if all_templates is not None else TEMPLATES
 
-    for key, tpl in TEMPLATES.items():
+    for key, tpl in source.items():
         score = 0
-        for kw in tpl["keywords"]:
+        keywords = tpl.get("keywords") or []
+        for kw in keywords:
             for h in headers:
                 if kw in (h or "").lower():
                     score += 1
@@ -1061,9 +846,9 @@ def parse_csv_content(raw: str):
     return headers, data_rows
 
 
-def build_template_rows_from_csv(template_key: str, headers: list, data_rows: list, header_mapping: dict):
+def build_template_rows_from_csv(template_key: str, headers: list, data_rows: list, header_mapping: dict, all_templates: dict = None):
     """Turn raw CSV rows into template-shaped rows using header_mapping."""
-    tpl = get_template(template_key)
+    tpl = get_template(template_key, all_templates)
     header_index = {h: i for i, h in enumerate(headers)}
 
     rows = []
@@ -1093,10 +878,11 @@ def build_header_prompt(
     template_fields: list = None,
     template_label: str = None,
     template_keywords: list = None,
-    sample_data: list = None
+    sample_data: list = None,
+    all_templates: dict = None
 ) -> str:
     """Build a JSON prompt for GPT to map uploaded headers to template fields."""
-    tpl = get_template(template_key)
+    tpl = get_template(template_key, all_templates)
 
     # Use enriched templateFields if provided, otherwise build from template
     if template_fields:
@@ -1251,7 +1037,7 @@ def call_openai_chat(prompt: str, call_type: str, tenant_id: str = None, job_id:
                 "temperature": 0,
                 "max_tokens": 2048,
             },
-            timeout=30,
+            timeout=120,
         )
         if resp.status_code != 200:
             print(f"DEBUG: OpenAI API Error: {resp.status_code} - {resp.text}")
@@ -1593,20 +1379,6 @@ def health():
     return jsonify({"status": "ok", "time": datetime.utcnow().isoformat() + "Z"})
 
 
-@app.route("/api/templates", methods=["GET"])
-def api_templates():
-    templates_list = []
-    for k, v in TEMPLATES.items():
-        templates_list.append({
-            "key": k, 
-            "label": v["label"], 
-            "keywords": v.get("keywords", []), 
-            "fields": v["fields"],
-            "dependencies": v.get("dependencies", []),
-            "references": v.get("references", {})
-        })
-    return jsonify(templates_list)
-
 
 @app.route("/api/tenant-data/search", methods=["GET"])
 def api_search_tenant_data():
@@ -1622,7 +1394,7 @@ def api_search_tenant_data():
     """
     # For POC, just grab generic tenant
     tenant_id = request.args.get("tenantId", "demo-tenant")
-    template_key = request.args.get("template")
+    template_key = request.args.get("template") or request.args.get("templateKey")
     query_text = request.args.get("q", "").strip()
     status_filter = request.args.get("status")
     
@@ -1637,7 +1409,7 @@ def api_search_tenant_data():
     mongo_query = {"tenantId": tenant_id}
     
     if template_key:
-        mongo_query["templateKey"] = template_key
+        mongo_query["templateKey"] = {"$regex": f"^{re.escape(template_key)}$", "$options": "i"}
 
     # Search logic (Text)
     if query_text:
@@ -1663,7 +1435,7 @@ def api_search_tenant_data():
     # Generic Field Filtering (e.g. &status=Pending -> data.status=Pending)
     # We iterate over all args and if they match a known field in the template (or just generic data param), we add it.
     # To be safe, we'll look for arguments that are NOT the standard ones.
-    reserved_args = {"tenantId", "template", "q", "limit", "skip"}
+    reserved_args = {"tenantId", "template", "templateKey", "q", "limit", "skip"}
     
     for k, v in request.args.items():
         if k not in reserved_args and v:
@@ -1825,15 +1597,17 @@ def api_import_preview():
     if not headers:
         return jsonify({"error": "CSV is empty or invalid"}), 400
 
+    all_templates = get_templates(tenant_id)
+
     if requested_template_key:
         try:
-            tpl = get_template(requested_template_key)
+            tpl = get_template(requested_template_key, all_templates)
             template_key = tpl["key"]
         except ValueError as ex:
             return jsonify({"error": str(ex)}), 400
     else:
-        template_key = detect_template_from_headers(headers)
-        tpl = get_template(template_key)
+        template_key = detect_template_from_headers(headers, all_templates)
+        tpl = get_template(template_key, all_templates)
 
     mappings = suggest_header_mappings(template_key, headers, existing_mapping)
 
@@ -1843,10 +1617,10 @@ def api_import_preview():
         suggested_mapping[m["templateKey"]] = m["matchedHeader"]
         mapping_sources[m["templateKey"]] = m["source"]
 
-    mapped_rows = build_template_rows_from_csv(template_key, headers, data_rows, suggested_mapping)
+    mapped_rows = build_template_rows_from_csv(template_key, headers, data_rows, suggested_mapping, all_templates)
 
     # 1) algorithmic clean
-    cleaned_rows_initial, row_errors_initial, inferred_ids_initial = clean_rows_for_template(template_key, mapped_rows)
+    cleaned_rows_initial, row_errors_initial, inferred_ids_initial = clean_rows_for_template(template_key, mapped_rows, all_templates)
 
     # 2) optional AI pass
     cleaned_rows = cleaned_rows_initial
@@ -1917,7 +1691,8 @@ def api_header_mapping():
         return jsonify({"error": "templateKey is required"}), 400
 
     try:
-        tpl = get_template(template_key)
+        all_templates = get_templates(tenant_id)
+        tpl = get_template(template_key, all_templates)
     except ValueError as ex:
         return jsonify({"error": str(ex)}), 400
 
@@ -1953,7 +1728,8 @@ def api_header_mapping():
         template_fields=template_fields,
         template_label=template_label,
         template_keywords=template_keywords,
-        sample_data=sample_data
+        sample_data=sample_data,
+        all_templates=all_templates
     )
     
     print(f"DEBUG: api_header_mapping generated prompt for {template_key}")
@@ -2016,6 +1792,47 @@ def api_header_mapping():
     return jsonify({"mappings": final_mappings, "aiUsage": ai_usage_summary})
 
 
+def detect_templates_with_ai(headers: list, sample_data: list, tenant_id: str, all_templates: dict = None) -> list:
+    """
+    Ask GPT which template(s) match the given headers/data.
+    Returns list of template keys.
+    """
+    if not (OPENAI_API_KEY and headers):
+        # Fallback to heuristic
+        heuristic = detect_template_from_headers(headers, all_templates)
+        return [heuristic] if heuristic else []
+
+    source = all_templates if all_templates is not None else TEMPLATES
+    candidates = []
+    for k, v in source.items():
+        candidates.append({
+            "key": k,
+            "label": v.get("label", k),
+            "keywords": v.get("keywords", [])
+        })
+
+    prompt_obj = {
+        "goal": "Identify which CSV template(s) best match the uploaded headers and sample data.",
+        "candidates": candidates,
+        "uploadedHeaders": headers,
+        "sampleData": sample_data[:5] if sample_data else [],
+        "instructions": [
+            "Return a JSON object with a single key 'matchedTemplates' containing a list of template keys.",
+            "If multiple templates match (e.g. mixed data or ambiguous), return all of them.",
+            "If no template matches well, return an empty list.",
+            "Prefer exact matches on keywords and field names."
+        ]
+    }
+    
+    prompt = json.dumps(prompt_obj, indent=2)
+    parsed, _ = call_openai_chat(prompt, call_type="detect-template", tenant_id=tenant_id)
+    
+    if parsed and isinstance(parsed, dict):
+        return parsed.get("matchedTemplates", [])
+    
+    return []
+
+
 @app.route("/api/import/ai/detect-and-map", methods=["POST"])
 
 def api_ai_detect_and_map():
@@ -2029,13 +1846,15 @@ def api_ai_detect_and_map():
         return jsonify({"error": "No headers provided"}), 400
 
     # 1. Template Detection (Ask AI for potentially multiple templates, or use provided)
+    all_templates = get_templates(tenant_id)
+    
     detected_keys = []
     if not allow_multi and data.get("templateKey"):
         # If multi-templates disabled and user already has a template selected,
         # skip AI detection and just use that template for mapping.
         detected_keys = [data["templateKey"]]
     else:
-        detected_keys = detect_templates_with_ai(uploaded_headers, sample_data, tenant_id)
+        detected_keys = detect_templates_with_ai(uploaded_headers, sample_data, tenant_id, all_templates)
         if not allow_multi and detected_keys:
             detected_keys = detected_keys[:1]
 
@@ -2048,7 +1867,7 @@ def api_ai_detect_and_map():
 
     for template_key in detected_keys:
         try:
-            tpl = get_template(template_key)
+            tpl = get_template(template_key, all_templates)
         except ValueError:
             continue
 
@@ -2068,7 +1887,7 @@ def api_ai_detect_and_map():
 
         # Run mapping
         # 0. Rule-Based Fallback (always compute)
-        rule_mappings = suggest_header_mappings(template_key, uploaded_headers, current_mapping={})
+        rule_mappings = suggest_header_mappings(template_key, uploaded_headers, current_mapping={}, all_templates=all_templates)
         rule_by_key = {m["templateKey"]: m for m in rule_mappings}
 
         # 1. AI Mapping (optional)
@@ -2079,11 +1898,13 @@ def api_ai_detect_and_map():
             template_fields=template_fields,
             template_label=tpl.get("label"),
             template_keywords=tpl.get("keywords"),
-            sample_data=sample_data
+            sample_data=sample_data,
+            all_templates=all_templates
         )
         print(f"DEBUG: api_ai_detect_and_map calling OpenAI for template {template_key}")
 
         parsed, usage = call_openai_chat(prompt, call_type="header-mapping", tenant_id=tenant_id)
+
 
         # Usage Tracking
         if usage:
@@ -2172,51 +1993,7 @@ def api_get_tenants():
     return jsonify({"tenants": tenants})
 
 
-def detect_templates_with_ai(headers: list, sample_data: list, tenant_id: str = None) -> list:
-    """
-    Ask AI to pick the best template(s) based on headers and sample data.
-    Returns a LIST of template keys.
-    """
-    if not OPENAI_API_KEY:
-        # Fallback to single detection (wrapped in list)
-        return [detect_template_from_headers(headers)]
 
-    # Build prompt
-    templates_info = []
-    for k, v in TEMPLATES.items():
-        templates_info.append({
-            "key": k,
-            "label": v["label"],
-            "keywords": v["keywords"]
-        })
-
-    prompt_obj = {
-        "task": "Identify ALL matching templates for the given CSV headers and sample data. A single CSV might contain data relevant to multiple templates (e.g. People AND Bookings).",
-        "templates": templates_info,
-        "uploadedHeaders": headers,
-        "sampleData": sample_data,
-        "instructions": [
-            "Return ONLY a JSON object: { \"templateKeys\": [string], \"confidence\": number }",
-            "Be conservative: Select only the templates that strongly match the majority of the data.",
-            "If the file looks like an intentional mix of distinct entities (e.g., both Person details AND separate Appointment records), return both keys.",
-            "If the file is primarily one entity type with a few extra fields, just return the single best-fitting template key.",
-            "Confidence is a number between 0 and 1."
-        ]
-    }
-    
-    print(f"DEBUG: detect_templates_with_ai calling OpenAI for headers: {headers[:5]}...")
-    try:
-        prompt = json.dumps(prompt_obj, indent=2)
-        parsed, _ = call_openai_chat(prompt, call_type="template-detection", tenant_id=tenant_id)
-
-        if parsed and isinstance(parsed, dict) and isinstance(parsed.get("templateKeys"), list):
-            found = [str(k) for k in parsed["templateKeys"] if k in TEMPLATES]
-            if found:
-                return found
-    except Exception as e:
-        print(f"Template detection failed: {e}")
-    
-    return [detect_template_from_headers(headers)]
 
 
 @app.route("/api/import/ai/clean", methods=["POST"])
@@ -2240,13 +2017,14 @@ def api_clean_values():
     if not template_key:
         return jsonify({"error": "templateKey is required"}), 400
 
+    all_templates = get_templates(tenant_id)
     try:
-        tpl = get_template(template_key)
+        tpl = get_template(template_key, all_templates)
     except ValueError as ex:
         return jsonify({"error": str(ex)}), 400
 
     # 1) algorithmic clean
-    cleaned_rows_initial, row_errors_initial, inferred_ids_initial = clean_rows_for_template(template_key, rows)
+    cleaned_rows_initial, row_errors_initial, inferred_ids_initial = clean_rows_for_template(template_key, rows, all_templates)
 
     # 2) AI pass (optional)
     cleaned_rows = cleaned_rows_initial
@@ -2270,7 +2048,7 @@ def api_clean_values():
             extras=extras,
             include_pii_in_ai=include_pii_in_ai,
         )
-        cleaned_rows, row_errors, inferred_ids = clean_rows_for_template(template_key, cleaned_rows_ai)
+        cleaned_rows, row_errors, inferred_ids = clean_rows_for_template(template_key, cleaned_rows_ai, all_templates)
 
     if template_key == "PatientData":
         for r in cleaned_rows:
@@ -2348,7 +2126,7 @@ def api_save_import():
 
 @app.route("/api/import/dump", methods=["POST"])
 def api_import_dump():
-    """Dump raw data to MongoDB without processing."""
+    """Store pre-cleaned data from frontend (already validated and edited by user)."""
     body = request.get_json(force=True, silent=False) or {}
     tenant_id = body.get("tenantId")
     template_key = body.get("templateKey")
@@ -2367,7 +2145,8 @@ def api_import_dump():
         "uploadId": upload_id,
         "tenantId": tenant_id,
         "templateKey": template_key,
-        "rawRows": rows,
+        "cleanedRows": rows,  # Pre-cleaned by frontend (not raw CSV)
+        "preCleaned": True,   # Flag to indicate data is already validated/cleaned
         "fileName": file_name,
         "uploadedAt": datetime.utcnow()
     }
@@ -2383,13 +2162,20 @@ def api_import_dump():
 
 @app.route("/api/import/trigger-job", methods=["POST"])
 def api_import_trigger_job():
-    """Trigger an ingestion job for a dumped upload with dependency-aware planning."""
+    """Trigger an ingestion job for MULTIPLE dumped uploads with dependency-aware planning."""
     body = request.get_json(force=True, silent=False) or {}
-    upload_id = body.get("uploadId")
+    
+    # Support both single and multiple for backward compatibility
+    upload_ids = body.get("uploadIds")
+    if not upload_ids:
+        single_id = body.get("uploadId")
+        if single_id:
+            upload_ids = [single_id]
+    
     tenant_id = body.get("tenantId")
 
-    if not upload_id:
-        return jsonify({"error": "uploadId is required"}), 400
+    if not upload_ids or not isinstance(upload_ids, list):
+        return jsonify({"error": "uploadIds list is required"}), 400
 
     coll_jobs = get_ingestion_jobs_collection()
     coll_raw = get_raw_uploads_collection()
@@ -2398,35 +2184,67 @@ def api_import_trigger_job():
     if coll_jobs is None or coll_raw is None or coll_records is None:
         return jsonify({"error": "MongoDB not connected"}), 500
 
-    # 1. Fetch the raw upload to know what we are dealing with
-    upload_doc = coll_raw.find_one({"uploadId": upload_id})
-    if not upload_doc:
-        return jsonify({"error": "Upload not found"}), 404
+    # 1. Fetch ALL raw uploads
+    # We need to map TemplateKey -> UploadDoc to plan correctly
+    upload_docs = list(coll_raw.find({"uploadId": {"$in": upload_ids}}))
+    
+    if len(upload_docs) != len(upload_ids):
+        return jsonify({"error": f"One or more uploads not found. Found {len(upload_docs)} of {len(upload_ids)}"}), 404
 
-    template_key = upload_doc.get("templateKey")
-    # For now, we handle single-template uploads, but design allows for multi-template triggers checks
-    affected_templates = [template_key]
+    # Validate they all belong to the same tenant (if strict)
+    # And gather template keys
+    affected_templates = []
+    template_to_upload_id = {}
+    
+    for doc in upload_docs:
+        t_key = doc.get("templateKey")
+        if t_key:
+            affected_templates.append(t_key)
+            template_to_upload_id[t_key] = doc["uploadId"]
+    
+    print(f"DEBUG: TriggerJob - Affected Templates: {affected_templates}")
+    print(f"DEBUG: TriggerJob - Template to Upload Mapping: {template_to_upload_id}")
+    for k, v in template_to_upload_id.items():
+        print(f"DEBUG: TriggerJob - Mapping Detail: '{k}' -> '{v}' (type: {type(v)})")
 
-    # 2. Build Job Plan & Execution Order
+    # 2. Plan Job
+    all_templates = get_templates(tenant_id)
     try:
-        execution_order = get_execution_order(affected_templates)
+        # Calculate order for the combined set of templates
+        execution_order = get_execution_order(affected_templates, all_templates)
+        print(f"DEBUG: TriggerJob - Execution Order: {execution_order}")
     except ValueError as e:
-        return jsonify({"error": f"Dependency cycle detected: {e}"}), 400
+        return jsonify({"error": f"Dependency Cycle: {e}"}), 400
 
     stages = {}
     for t_key in execution_order:
-        deps = TEMPLATES.get(t_key, {}).get("dependencies", [])
+        # Find which upload provides this template
+        u_id = template_to_upload_id.get(t_key)
+        
+        if not u_id:
+            print(f"DEBUG: TriggerJob - Skipping template '{t_key}' in plan because no upload provides it.")
+            continue
+
+        # Get row count from the specific upload doc
+        u_doc = next((d for d in upload_docs if d["uploadId"] == u_id), None)
+        row_count = len(u_doc.get("cleanedRows") or u_doc.get("rawRows", [])) if u_doc else 0
+
         stages[t_key] = {
             "status": "pending",
-            "blockedBy": deps,  # This will be checked against resolved entities at runtime
-            "rowCount": len(upload_doc.get("rawRows", []))
+            "blockedBy": TEMPLATES.get(t_key, {}).get("dependencies", []),
+            "uploadId": u_id, # CRITICAL: Link stage to specific upload
+            "rowCount": row_count
         }
+
+    print(f"DEBUG: TriggerJob - Final Stages Config: {list(stages.keys())}")
+    for st, cfg in stages.items():
+        print(f"DEBUG: TriggerJob - Stage '{st}' uploadId: '{cfg.get('uploadId')}' (type: {type(cfg.get('uploadId'))})")
 
     job_id = str(uuid.uuid4())
     job_doc = {
         "jobId": job_id,
-        "uploadId": upload_id,
-        "tenantId": tenant_id or upload_doc.get("tenantId"),
+        "uploadIds": upload_ids, # Store all
+        "tenantId": tenant_id or upload_docs[0].get("tenantId"),
         "status": "pending",
         "jobPlan": {
             "executionOrder": execution_order,
@@ -2437,33 +2255,40 @@ def api_import_trigger_job():
         "error": None
     }
     
+    print(f"DEBUG: TriggerJob - FINAL job_doc jobId: {job_id}, stages: {list(job_doc['jobPlan']['stages'].keys())}")
+    for k, v in job_doc['jobPlan']['stages'].items():
+         print(f"DEBUG: TriggerJob - FINAL Stage '{k}' uploadId: '{v.get('uploadId')}'")
+    
     res = coll_jobs.insert_one(job_doc)
-    print(f"DEBUG: Created Job {job_id} with Plan: {stages.keys()}")
+    print(f"DEBUG: Created Job {job_id} in DB.")
 
-    # 3. Create Row-Level Ingestion Records
-    # These tracks the lifecycle of every single row
-    raw_rows = upload_doc.get("rawRows", [])
+    # 3. Create Row-Level Ingestion Records for ALL uploads
     ingestion_records = []
     
-    for idx, row in enumerate(raw_rows):
-        # Basic record structure
-        rec = {
-            "jobId": job_id,
-            "uploadId": upload_id,
-            "tenantId": tenant_id,
-            "templateKey": template_key,
-            "rowIndex": idx,
-            "status": "pending",  # pending -> processing -> resolved / error
-            "data": row,          # The raw data
-            "errors": [],
-            "resolution": {
-                "entityId": None,       # To be populated on success
-                "parentResolved": False # Logic to check parents goes here later
-            },
-            "createdAt": datetime.utcnow()
-        }
-        ingestion_records.append(rec)
-
+    for u_doc in upload_docs:
+        u_id = u_doc["uploadId"]
+        t_key = u_doc.get("templateKey")
+        cleaned_rows = u_doc.get("cleanedRows") or u_doc.get("rawRows", [])
+        
+        for idx, row in enumerate(cleaned_rows):
+            rec = {
+                "jobId": job_id,
+                "uploadId": u_id,
+                "tenantId": tenant_id,
+                "templateKey": t_key,
+                "rowIndex": idx,
+                "status": "pending",
+                "data": row,
+                "preCleaned": u_doc.get("preCleaned", False),
+                "errors": [],
+                "resolution": {
+                    "entityId": None,
+                    "parentResolved": False
+                },
+                "createdAt": datetime.utcnow()
+            }
+            ingestion_records.append(rec)
+    
     if ingestion_records:
         coll_records.insert_many(ingestion_records)
         print(f"DEBUG: Inserted {len(ingestion_records)} ingestion records for Job {job_id}")
@@ -2471,7 +2296,7 @@ def api_import_trigger_job():
     return jsonify({
         "message": "Ingestion job triggered successfully",
         "jobId": job_id,
-        "uploadId": upload_id,
+        "uploadIds": upload_ids,
         "plan": job_doc["jobPlan"]
     })
 
@@ -2613,7 +2438,8 @@ def api_get_data():
             query["data.id"] = {"$in": target_ids}
             print(f"DEBUG: Fetching data with query: {query}")
             print(f"DEBUG: Target IDs: {target_ids}")
-            cursor = coll_data.find(query).limit(100)
+            # Increased limit to 5000 to ensure full job history visibility
+            cursor = coll_data.find(query).limit(5000)
             
             for doc in cursor:
                 print(f"DEBUG: Document __operation field: {doc.get('__operation', 'NOT FOUND')}")
@@ -2632,8 +2458,8 @@ def api_get_data():
         return jsonify({"data": results})
 
     # Default / Legacy behavior (if no jobId, or for general browser)
-    # Fetch latest imports first
-    cursor = coll_data.find(query).sort("timestamp", -1).limit(100)
+    # Fetch latest imports first (limit increased to 1000)
+    cursor = coll_data.find(query).sort("timestamp", -1).limit(1000)
     
     results = []
     for doc in cursor:
@@ -2726,232 +2552,391 @@ def api_get_job_records(job_id):
 
 
 # --------------------------------------------------------------------------
-# Background Worker: Job Processing
+# Template Builder API Endpoints
 # --------------------------------------------------------------------------
-def process_ingestion_jobs():
-    """
-    Background worker that polls for pending jobs and processes them.
-    Logic:
-      1. Find pending jobs (sorted by creation).
-      2. Check dependencies (if job A depends on B, B must be completed).
-      3. If runnable, switch status to 'processing'.
-      4. Iterate records:
-         - Resolve references (look up parent in tenant_data).
-         - Upsert into tenant_data (using primary keys).
-         - Update record status to 'resolved'.
-      5. Update job status to 'completed'.
-    """
-    print("WORKER: Ingestion processing thread started.")
+
+@app.route("/api/templates", methods=["GET"])
+def api_get_templates():
+    """Get all templates for a tenant (custom + defaults)."""
+    tenant_id = request.args.get("tenantId")
+    if not tenant_id:
+        return jsonify({"error": "tenantId is required"}), 400
     
-    while True:
-        try:
-            coll_jobs = get_ingestion_jobs_collection()
-            coll_records = get_ingestion_records_collection()
-            coll_data = get_tenant_data_collection()
-            coll_uploads = get_raw_uploads_collection()
+    coll_templates = get_templates_collection()
+    if coll_templates is None:
+        # If DB not connected, return only hardcoded templates
+        return jsonify({"templates": list(TEMPLATES.values())})
+    
+    # Fetch custom templates from DB
+    custom_templates = list(coll_templates.find({"tenantId": tenant_id}))
+    
+    # Convert ObjectId to string for JSON serialization
+    for tpl in custom_templates:
+        tpl["_id"] = str(tpl["_id"])
+        if "createdAt" in tpl:
+            tpl["createdAt"] = tpl["createdAt"].isoformat() + "Z"
+        if "updatedAt" in tpl:
+            tpl["updatedAt"] = tpl["updatedAt"].isoformat() + "Z"
+    
+    # Merge with hardcoded templates (custom templates override)
+    all_templates = {**TEMPLATES}
+    for tpl in custom_templates:
+        all_templates[tpl["templateKey"]] = tpl
+    
+    result = {"templates": list(all_templates.values())}
+    print(f"DEBUG: Returning templates response: {type(result)}, keys: {all_templates.keys()}, count: {len(result['templates'])}")
+    return jsonify(result)
 
-            if coll_jobs is None or coll_records is None or coll_data is None:
-                time.sleep(5)
-                continue
 
-            # 1. Find pending jobs
-            # Sort by triggeredAt asc to process oldest first
-            pending_jobs = list(coll_jobs.find({"status": "pending"}).sort("triggeredAt", 1))
 
-            for job in pending_jobs:
-                job_id = job["jobId"]
-                tenant_id = job["tenantId"]
-                job_plan = job.get("jobPlan", {})
-                execution_order = job_plan.get("executionOrder", [])
-                
-                print(f"WORKER: Starting Job {job_id}...")
-                
-                # Mark as processing
-                coll_jobs.update_one({"_id": job["_id"]}, {"$set": {"status": "processing"}})
-                
-                any_error = False
-                
-                # Initialize granular metrics
-                job_metrics = {
-                    "totalRecords": 0,
-                    "created": 0,
-                    "updated": 0,
-                    "errors": 0,
-                    "byTemplate": {}
-                }
-                
-                # Process strictly in plan order
-                for stage in execution_order: # e.g. "People", "Bookings"
-                    print(f"WORKER: Processing stage '{stage}' for Job {job_id}")
+@app.route("/api/templates", methods=["POST"])
+def api_create_template():
+    """Create a new custom template."""
+    body = request.get_json(force=True, silent=False) or {}
+    tenant_id = body.get("tenantId")
+    template_key = body.get("templateKey")
+    
+    if not tenant_id or not template_key:
+        return jsonify({"error": "tenantId and templateKey are required"}), 400
+    
+    # Validate template key (alphanumeric + underscores only)
+    if not re.match(r'^[a-zA-Z0-9_]+$', template_key):
+        return jsonify({"error": "templateKey must be alphanumeric with underscores only"}), 400
+    
+    coll_templates = get_templates_collection()
+    if coll_templates is None:
+        return jsonify({"error": "MongoDB not connected"}), 500
+    
+    # Check if template already exists
+    existing = coll_templates.find_one({"tenantId": tenant_id, "templateKey": template_key})
+    if existing:
+        return jsonify({"error": f"Template '{template_key}' already exists"}), 409
+    
+    # Validate at least 1 field
+    fields = body.get("fields", [])
+    if not fields or len(fields) == 0:
+        return jsonify({"error": "At least 1 field is required"}), 400
+    
+    # Validate at least 1 identifier field
+    has_identifier = any(f.get("identifier") for f in fields)
+    if not has_identifier:
+        return jsonify({"error": "At least 1 identifier field is required"}), 400
+    
+    # Create template document
+    template_doc = {
+        "tenantId": tenant_id,
+        "templateKey": template_key,
+        "templateLabel": body.get("templateLabel", template_key),
+        "keywords": body.get("keywords", []),
+        "dependencies": body.get("dependencies", []),
+        "references": body.get("references", {}),
+        "fields": fields,
+        "locked": body.get("locked", False),
+        "createdAt": datetime.utcnow(),
+        "updatedAt": datetime.utcnow(),
+        "createdBy": body.get("createdBy", "unknown")
+    }
+    
+    result = coll_templates.insert_one(template_doc)
+    template_doc["_id"] = str(result.inserted_id)
+    template_doc["createdAt"] = template_doc["createdAt"].isoformat() + "Z"
+    template_doc["updatedAt"] = template_doc["updatedAt"].isoformat() + "Z"
+    
+    return jsonify({"message": "Template created successfully", "template": template_doc}), 201
 
-                    # Determine expected template key
-                    upload_id = job.get("uploadId")
-                    upload_doc = coll_uploads.find_one({"uploadId": upload_id})
-                    
-                    if not upload_doc:
-                        print(f"WORKER: Upload {upload_id} not found for Job {job_id}")
-                        continue
-                        
-                    template_key = upload_doc.get("templateKey")
-                    
-                    if stage != template_key:
-                        continue
-                        
-                    tpl_def = TEMPLATES.get(template_key)
-                    if not tpl_def:
-                        continue
 
-                    # Initialize template-specific metrics
-                    if template_key not in job_metrics["byTemplate"]:
-                        job_metrics["byTemplate"][template_key] = {
-                            "created": 0,
-                            "updated": 0,
-                            "errors": 0
-                        }
+@app.route("/api/templates/<template_key>", methods=["GET"])
+def api_get_template(template_key):
+    """Get a single template by key."""
+    tenant_id = request.args.get("tenantId")
+    if not tenant_id:
+        return jsonify({"error": "tenantId is required"}), 400
+    
+    coll_templates = get_templates_collection()
+    if coll_templates is None:
+        # Check hardcoded templates
+        if template_key in TEMPLATES:
+            return jsonify({"template": TEMPLATES[template_key]})
+        return jsonify({"error": "Template not found"}), 404
+    
+    # Check custom templates first
+    template = coll_templates.find_one({"tenantId": tenant_id, "templateKey": template_key})
+    if template:
+        template["_id"] = str(template["_id"])
+        if "createdAt" in template:
+            template["createdAt"] = template["createdAt"].isoformat() + "Z"
+        if "updatedAt" in template:
+            template["updatedAt"] = template["updatedAt"].isoformat() + "Z"
+        return jsonify({"template": template})
+    
+    # Fallback to hardcoded templates
+    if template_key in TEMPLATES:
+        return jsonify({"template": TEMPLATES[template_key]})
+    
+    return jsonify({"error": "Template not found"}), 404
 
-                    # Process records
-                    records_cursor = coll_records.find({"jobId": job_id, "status": "pending"})
-                    record_count = coll_records.count_documents({"jobId": job_id, "status": "pending"})
-                    print(f"WORKER: Found {record_count} pending records for Job {job_id}")
-                    
-                    job_metrics["totalRecords"] += record_count
 
-                    for rec in records_cursor:
-                        try:
-                            row_data = rec.get("data", {})
+@app.route("/api/templates/<template_key>", methods=["PUT"])
+def api_update_template(template_key):
+    """Update an existing template."""
+    body = request.get_json(force=True, silent=False) or {}
+    tenant_id = body.get("tenantId")
+    
+    if not tenant_id:
+        return jsonify({"error": "tenantId is required"}), 400
+    
+    coll_templates = get_templates_collection()
+    if coll_templates is None:
+        return jsonify({"error": "MongoDB not connected"}), 500
+    
+    # Check if template exists
+    existing = coll_templates.find_one({"tenantId": tenant_id, "templateKey": template_key})
+    if not existing:
+        return jsonify({"error": f"Template '{template_key}' not found"}), 404
+    
+    # Validate fields if provided
+    fields = body.get("fields")
+    if fields is not None:
+        if len(fields) == 0:
+            return jsonify({"error": "At least 1 field is required"}), 400
+        has_identifier = any(f.get("identifier") for f in fields)
+        if not has_identifier:
+            return jsonify({"error": "At least 1 identifier field is required"}), 400
+    
+    # Update template
+    update_data = {
+        "updatedAt": datetime.utcnow()
+    }
+    
+    if "templateLabel" in body:
+        update_data["templateLabel"] = body["templateLabel"]
+    if "keywords" in body:
+        update_data["keywords"] = body["keywords"]
+    if "dependencies" in body:
+        update_data["dependencies"] = body["dependencies"]
+    if "references" in body:
+        update_data["references"] = body["references"]
+    if "locked" in body:
+        update_data["locked"] = body["locked"]
+    if "fields" in body:
+        update_data["fields"] = body["fields"]
+    
+    coll_templates.update_one(
+        {"tenantId": tenant_id, "templateKey": template_key},
+        {"$set": update_data}
+    )
+    
+    # Fetch updated template
+    updated = coll_templates.find_one({"tenantId": tenant_id, "templateKey": template_key})
+    updated["_id"] = str(updated["_id"])
+    if "createdAt" in updated:
+        updated["createdAt"] = updated["createdAt"].isoformat() + "Z"
+    if "updatedAt" in updated:
+        updated["updatedAt"] = updated["updatedAt"].isoformat() + "Z"
+    
+    return jsonify({"message": "Template updated successfully", "template": updated})
 
-                            # 1. Resolve References
-                            refs = tpl_def.get("references", {})
-                            resolved_links = {}
-                            
-                            for field, ref_config in refs.items():
-                                target_tpl = ref_config["targetTemplate"]
-                                target_field = ref_config["targetField"]
-                                source_val = row_data.get(field)
-                                
-                                if source_val:
-                                    parent = coll_data.find_one({
-                                        "tenantId": tenant_id,
-                                        "templateKey": target_tpl,
-                                        f"data.{target_field}": source_val
-                                    })
-                                    
-                                    if parent:
-                                        resolved_links[f"_parentRef_{field}"] = {
-                                            "collection": target_tpl,
-                                            "id": str(parent["_id"]),
-                                            "label": f"{target_tpl} {source_val}" 
-                                        }
 
-                            # 2. Upsert Logic with tracking
-                            primary_keys = [f["key"] for f in tpl_def["fields"] if f.get("identifier")]
-                            query = {"tenantId": tenant_id, "templateKey": template_key}
-                            
-                            if primary_keys:
-                                for pk in primary_keys:
-                                    val = row_data.get(pk)
-                                    if val is not None:
-                                        query[f"data.{pk}"] = val
-                                        
-                                final_data = {**row_data, **resolved_links}
-                                
-                                # Check if record exists before upsert
-                                existing = coll_data.find_one(query)
-                                
-                                result = coll_data.update_one(
-                                    query,
-                                    {"$set": {
-                                        "data": final_data,
-                                        "timestamp": datetime.now(),
-                                        "jobId": job_id
-                                    }},
-                                    upsert=True
-                                )
-                                
-                                # Track whether this was create or update
-                                if result.upserted_id:
-                                    job_metrics["created"] += 1
-                                    job_metrics["byTemplate"][template_key]["created"] += 1
-                                    action = "created"
-                                elif existing:
-                                    job_metrics["updated"] += 1
-                                    job_metrics["byTemplate"][template_key]["updated"] += 1
-                                    action = "updated"
-                                else:
-                                    # Edge case: matched but not updated
-                                    action = "matched"
-                                
-                                # Store operation metadata on the record
-                                print(f"WORKER: About to store __operation='{action}' for query: {query}")
-                                result2 = coll_data.update_one(
-                                    query,
-                                    {"$set": {"__operation": action}}
-                                )
-                                print(f"WORKER: Stored __operation. Matched: {result2.matched_count}, Modified: {result2.modified_count}")
-                                
-                                print(f"WORKER: {action.capitalize()} record for {pk}={val}. JobID: {job_id}")
-                            else:
-                                final_data = {**row_data, **resolved_links}
-                                action = "created"  # Set action for insert path
-                                coll_data.insert_one({
-                                    "tenantId": tenant_id,
-                                    "templateKey": template_key,
-                                    "data": final_data,
-                                    "timestamp": datetime.now(),
-                                    "jobId": job_id,
-                                    "__operation": action
-                                })
-                                job_metrics["created"] += 1
-                                job_metrics["byTemplate"][template_key]["created"] += 1
+@app.route("/api/templates/<template_key>", methods=["DELETE"])
+def api_delete_template(template_key):
+    """Delete a template (with validation)."""
+    tenant_id = request.args.get("tenantId")
+    if not tenant_id:
+        return jsonify({"error": "tenantId is required"}), 400
+    
+    coll_templates = get_templates_collection()
+    if coll_templates is None:
+        return jsonify({"error": "MongoDB not connected"}), 500
+    
+    # Check if template exists
+    existing = coll_templates.find_one({"tenantId": tenant_id, "templateKey": template_key})
+    if not existing:
+        return jsonify({"error": f"Template '{template_key}' not found"}), 404
+    
+    # Check if data exists for this template
+    coll_data = get_tenant_data_collection()
+    if coll_data is not None:
+        data_count = coll_data.count_documents({"tenantId": tenant_id, "templateKey": template_key})
+        force_delete = request.args.get("force", "false").lower() == "true"
+        
+        if data_count > 0:
+            if not force_delete:
+                return jsonify({
+                    "error": f"Cannot delete template '{template_key}' because {data_count} records exist. Delete the data first or confirm force delete."
+                }), 409
+            else:
+                # Force delete: remove the data first
+                coll_data.delete_many({"tenantId": tenant_id, "templateKey": template_key})
 
-                            # 3. Mark Record Resolved AND Save Snapshot
-                            # Include __operation in snapshot
-                            snapshot_data = {**final_data, "__operation": action}
-                            coll_records.update_one(
-                                {"_id": rec["_id"]}, 
-                                {
-                                    "$set": {
-                                        "status": "resolved",
-                                        "processedData": snapshot_data
-                                    }
-                                }
-                            )
-                            
-                        except Exception as e:
-                            print(f"WORKER: Error processing row {rec.get('rowIndex')}: {e}")
-                            coll_records.update_one(
-                                {"_id": rec["_id"]}, 
-                                {"$set": {"status": "error", "error": str(e)}}
-                            )
-                            job_metrics["errors"] += 1
-                            job_metrics["byTemplate"][template_key]["errors"] += 1
-                            any_error = True
+    # Delete template
+    coll_templates.delete_one({"tenantId": tenant_id, "templateKey": template_key})
+    
+    return jsonify({"message": f"Template '{template_key}' deleted successfully"})
 
-                # Job Complete with metrics
-                final_status = "error" if any_error else "completed"
-                coll_jobs.update_one(
-                    {"_id": job["_id"]}, 
-                    {"$set": {
-                        "status": final_status, 
-                        "completedAt": datetime.now(),
-                        "metrics": job_metrics
-                    }}
-                )
-                print(f"WORKER: Job {job_id} finished with status {final_status}")
-                print(f"WORKER: Metrics - Created: {job_metrics['created']}, Updated: {job_metrics['updated']}, Errors: {job_metrics['errors']}")
 
-            time.sleep(2) # Poll interval
+@app.route("/api/admin/reset-data", methods=["DELETE"])
+def api_reset_tenant_data():
+    """Clear all data for a tenant (except templates)."""
+    tenant_id = request.args.get("tenantId")
+    if not tenant_id:
+        return jsonify({"error": "tenantId is required"}), 400
+
+    pwd = request.args.get("password")
+    # Simple safety check (in real app, use proper auth)
+    # limit to localhost or specific secret if needed, but for POC just strict param
+    if not pwd or pwd != "secret-reset": 
+         # We can relax this for the POC or make it a simple prompt in UI
+         pass 
+
+    try:
+        from db_config import (
+            get_tenant_data_collection, 
+            get_ingestion_records_collection,
+            get_ingestion_jobs_collection,
+            get_raw_uploads_collection,
+            get_imports_collection
+        )
+        
+        # 1. Tenant Data
+        c_data = get_tenant_data_collection()
+        r1 = c_data.delete_many({"tenantId": tenant_id})
+        
+        # 2. Ingestion Records (jobs row data)
+        # We need to find jobs for this tenant first to be safe, 
+        # or just delete by generic if we store tenantId on records (we don't always).
+        # Actually records have jobId. Jobs have tenantId.
+        
+        c_jobs = get_ingestion_jobs_collection()
+        jobs = list(c_jobs.find({"tenantId": tenant_id}, {"jobId": 1}))
+        job_ids = [j["jobId"] for j in jobs]
+        
+        c_records = get_ingestion_records_collection()
+        r2 = c_records.delete_many({"jobId": {"$in": job_ids}})
+        
+        # 3. Jobs
+        r3 = c_jobs.delete_many({"tenantId": tenant_id})
+        
+        # 4. Uploads (Optional)
+        c_uploads = get_raw_uploads_collection()
+        r4 = c_uploads.delete_many({"tenantId": tenant_id})
+        
+        # 5. Imports (Legacy)
+        c_imports = get_imports_collection()
+        r5 = c_imports.delete_many({"tenantId": tenant_id})
+
+        return jsonify({
+            "message": f"Reset complete for {tenant_id}",
+            "deleted": {
+                "tenant_data": r1.deleted_count,
+                "records": r2.deleted_count,
+                "jobs": r3.deleted_count,
+                "uploads": r4.deleted_count
+            }
+        })
+        
+    except Exception as e:
+        print(f"RESET ERROR: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# --------------------------------------------------------------------------
+# Background Worker: Job Processing (Imported from processing_worker.py)
+# --------------------------------------------------------------------------
+from processing_worker import process_ingestion_jobs
+
+
+
+
+MOCK_DATA_CACHE = {}
+
+@app.route("/api/ai/generate_mock_data", methods=["POST"])
+def api_generate_mock_data():
+    """Generate mock data based on template schema using AI."""
+    body = request.get_json(force=True, silent=False) or {}
+    fields = body.get("fields", [])
+    
+    if not fields:
+        return jsonify({"error": "No fields provided"}), 400
+
+    # Cache Check
+    cache_key = None
+    try:
+        # Create a stable hash of the schema definition
+        cache_key = hashlib.md5(json.dumps(fields, sort_keys=True).encode("utf-8")).hexdigest()
+        if cache_key in MOCK_DATA_CACHE:
+            print(f"DEBUG: Cache hit for mock data (Key: {cache_key})")
+            cached_data = list(MOCK_DATA_CACHE[cache_key]) # copy
+            random.shuffle(cached_data)
+            return jsonify({"data": cached_data})
+    except Exception as ex:
+        print(f"DEBUG: Cache key generation failed: {ex}")
+
+    if not OPENAI_API_KEY:
+        return jsonify({"error": "OpenAI API key not configured"}), 503
+
+    # Construct prompt
+    schema_desc = []
+    for f in fields:
+        desc = f"Key: {f['key']} (Type: {f.get('pattern', 'string')})"
+        if f.get('pattern') == 'enum' and f.get('allowed'):
+            desc += f": {', '.join(f['allowed'][:5])}..."
+        if f.get('label'):
+            desc += f" - Content/Label: {f['label']}"
+        schema_desc.append(desc)
+    
+    prompt = (
+        "Generate 15 rows of realistic mock data for a CSV import file based on this schema:\n"
+        + "\n".join(schema_desc)
+        + "\n\nReturn ONLY a valid JSON array of objects. Do not wrap in markdown or code blocks. "
+        "IMPORTANT: The keys in your JSON objects MUST MATCH the 'Key: ...' values exactly. Do not use the labels as keys."
+    )
+
+    try:
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+        }
+        payload = {
+            "model": OPENAI_MODEL,
+            "messages": [
+                {"role": "system", "content": "You are a data generator helper."},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.7,
+        }
+        
+        resp = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=30)
+        resp_json = resp.json()
+        
+        if "error" in resp_json:
+            return jsonify({"error": str(resp_json["error"])}), 500
             
-        except Exception as e:
-            print(f"WORKER CRASH: {e}")
-            time.sleep(5)
+        content = resp_json["choices"][0]["message"]["content"]
+        
+        # Clean potential markdown
+        content = content.replace("```json", "").replace("```", "").strip()
+        
+        data = json.loads(content)
+        
+        # Update Cache
+        if cache_key and isinstance(data, list):
+             MOCK_DATA_CACHE[cache_key] = data
+             
+        return jsonify({"data": data})
+
+    except Exception as e:
+        print(f"AI MOCK ERROR: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
-    # Start background worker
-    print("MAIN: Starting background worker thread...")
-    t = threading.Thread(target=process_ingestion_jobs, daemon=True)
-    t.start()
+    # Start background worker only if we are in the reloader process (or if reloader is disabled)
+    # When using use_reloader=True, the script is run twice. 
+    # WERKZEUG_RUN_MAIN is set to 'true' in the child process.
+    if os.environ.get("WERKZEUG_RUN_MAIN") == "true" or os.environ.get("FLASK_DEBUG") != "1":
+        print("MAIN: Starting background worker thread...")
+        t = threading.Thread(target=process_ingestion_jobs, daemon=True)
+        t.start()
     
-    # Disable reloader to prevent double-execution/socket errors with threading
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True, use_reloader=False)
+    # Enable reloader for better DX
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True, use_reloader=True)
