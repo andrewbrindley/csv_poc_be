@@ -1,0 +1,47 @@
+--- LATEST INGESTION RECORDS (NO FILTER) ---
+{
+  "_id": "699152b8fa8ae212ac06e727",
+  "jobId": "f1021214-c939-49ca-8bcf-379c9c2bc6f8",
+  "uploadId": "02f8c9c7-1427-4ea2-93a2-167c54297f33",
+  "tenantId": "test-tenant",
+  "templateKey": "PatientData",
+  "rowIndex": 0,
+  "status": "error",
+  "data": {
+    "patientId": "9999",
+    "assessmentName": "Audiometry",
+    "status": "Pending",
+    "tests": "Hearing"
+  },
+  "preCleaned": true,
+  "errors": [],
+  "resolution": {
+    "entityId": null,
+    "parentResolved": false
+  },
+  "createdAt": "2026-02-15T04:59:36.922000",
+  "error": "Foreign Key Violation: Field 'patientId' value '9999' not found in People"
+}
+{
+  "_id": "6991525935b28c930efd8b74",
+  "jobId": "77d1cd38-918a-4cc9-9326-5b532b530dee",
+  "uploadId": "d59916df-c3e2-46c5-b5c2-983960da8680",
+  "tenantId": "test-tenant",
+  "templateKey": "PatientData",
+  "rowIndex": 0,
+  "status": "error",
+  "data": {
+    "patientId": "9999",
+    "assessmentName": "Audiometry",
+    "status": "Pending",
+    "tests": "Hearing"
+  },
+  "preCleaned": true,
+  "errors": [],
+  "resolution": {
+    "entityId": null,
+    "parentResolved": false
+  },
+  "createdAt": "2026-02-15T04:58:01.513000",
+  "error": "Foreign Key Violation: Field 'patientId' value '9999' not found in People"
+}

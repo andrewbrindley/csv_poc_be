@@ -1,0 +1,80 @@
+TIMESTAMP: 2026-02-15 16:00:31.885933
+
+--- LATEST JOBS ---
+{
+  "_id": "699152b8fa8ae212ac06e726",
+  "jobId": "f1021214-c939-49ca-8bcf-379c9c2bc6f8",
+  "uploadIds": [
+    "02f8c9c7-1427-4ea2-93a2-167c54297f33"
+  ],
+  "tenantId": "test-tenant",
+  "status": "error",
+  "jobPlan": {
+    "executionOrder": [
+      "PatientData"
+    ],
+    "stages": {
+      "PatientData": {
+        "status": "pending",
+        "blockedBy": [
+          "People"
+        ],
+        "uploadId": "02f8c9c7-1427-4ea2-93a2-167c54297f33",
+        "rowCount": 1
+      }
+    }
+  },
+  "triggeredAt": "2026-02-15T04:59:36.851000",
+  "completedAt": "2026-02-15T15:59:37.313000",
+  "error": null,
+  "metrics": {
+    "totalRecords": 1,
+    "created": 0,
+    "updated": 0,
+    "errors": 1
+  }
+}
+{
+  "_id": "6991525935b28c930efd8b73",
+  "jobId": "77d1cd38-918a-4cc9-9326-5b532b530dee",
+  "uploadIds": [
+    "d59916df-c3e2-46c5-b5c2-983960da8680"
+  ],
+  "tenantId": "test-tenant",
+  "status": "error",
+  "jobPlan": {
+    "executionOrder": [
+      "PatientData"
+    ],
+    "stages": {
+      "PatientData": {
+        "status": "pending",
+        "blockedBy": [
+          "People"
+        ],
+        "uploadId": "d59916df-c3e2-46c5-b5c2-983960da8680",
+        "rowCount": 1
+      }
+    }
+  },
+  "triggeredAt": "2026-02-15T04:58:01.458000",
+  "completedAt": "2026-02-15T15:58:01.991000",
+  "error": null,
+  "metrics": {
+    "totalRecords": 1,
+    "created": 0,
+    "updated": 0,
+    "errors": 1
+  }
+}
+{
+  "_id": "6981927331aad8f5dc31c612",
+  "jobId": "ef154642-a2ef-4b74-a45d-ca23d93d2bb1",
+  "uploadId": "26f7a3be-e6e5-4ca5-aea3-d3bbe54d0826",
+  "tenantId": "test-tenant",
+  "status": "completed",
+  "triggeredAt": "2026-02-03T06:15:15.966000",
+  "completedAt": "2026-02-06T20:25:41.592000"
+}
+
+--- LATEST RECORDS (PatientData) ---

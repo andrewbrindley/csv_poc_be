@@ -133,10 +133,6 @@ TEMPLATES = {
     "Bookings": {
         "key": "Bookings",
         "label": "Bookings (Assessment Appointments)",
-        "dependencies": ["People"],
-        "references": {
-            "personNumber": {"targetTemplate": "People", "targetField": "id"}
-        },
         "keywords": [
             "booking",
             "appointment",
@@ -176,6 +172,10 @@ TEMPLATES = {
                     "person id",
                 ],
                 "pattern": "relationship",
+                "relationship": {
+                    "targetTemplate": "People",
+                    "targetField": "id"
+                },
                 "description": "Numeric ID of the person being assessed.",
                 "examples": ["1001", "54022"],
             },
@@ -241,10 +241,6 @@ TEMPLATES = {
     "PatientData": {
         "key": "PatientData",
         "label": "Patient Data",
-        "dependencies": ["People"],
-        "references": {
-            "patientId": {"targetTemplate": "People", "targetField": "id"}
-        },
         "keywords": ["patient", "candidate", "employee", "assessment", "test", "block", "status", "notes"],
         "fields": [
             {
@@ -263,6 +259,10 @@ TEMPLATES = {
                     "emp#",
                 ],
                 "pattern": "relationship",
+                "relationship": {
+                    "targetTemplate": "People",
+                    "targetField": "id"
+                },
                 "sequence": "+1",
                 "description": "Unique numeric ID for the patient.",
                 "examples": ["1001", "54022"],

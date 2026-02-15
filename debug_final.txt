@@ -1,0 +1,18 @@
+JOB: 13188313-24f2-415f-a282-aa00a12d59de
+STATUS: error
+METRICS: {"totalRecords": 4, "created": 0, "updated": 0, "errors": 4}
+TRIGGERED: 2026-02-15 04:13:40.578000
+RECORDS TOTAL: 4
+  Row 0: status=resolved, error=Foreign Key Violation: Field 'patientId' value '7001' not found in People, hasProcessedData=True
+  Row 1: status=resolved, error=Foreign Key Violation: Field 'patientId' value '7002' not found in People, hasProcessedData=True
+  Row 2: status=error, error=Foreign Key Violation: Field 'patientId' value '7003' not found in People, hasProcessedData=True
+  Row 3: status=error, error=Foreign Key Violation: Field 'patientId' value '7004' not found in People, hasProcessedData=True
+TENANT_DATA LINKED: 4
+  PatientData | Op: created | Data: {'patientId': '7002', 'assessmentName': 'Post-op Knee', 'blockName': 'Block1', 'tests': 'High', 'status': 'Completed', 'notes': 'Off work 3 weeks, follow-up scheduled'}
+  PatientData | Op: created | Data: {'patientId': '7003', 'assessmentName': 'Stress & Fatigue', 'blockName': 'Block1', 'tests': 'Low', 'status': 'In Progress', 'notes': 'Light duties recommended'}
+  PatientData | Op: created | Data: {'patientId': '7004', 'assessmentName': 'Rtw Assessment', 'blockName': 'Block1', 'tests': 'Medium', 'status': 'Completed', 'notes': 'Awaiting imaging'}
+  PatientData | Op: created | Data: {'patientId': '7001', 'assessmentName': 'Lower Back Pain', 'blockName': 'Block1', 'tests': 'Medium', 'status': 'Pending', 'notes': 'Physio ongoing, works full time'}
+
+GLOBAL SEARCH for 7001/7002:
+  PatientData | JobId: 13188313-24f2-415f-a282-aa00a12d59de | Timestamp: 2026-02-15 15:13:40.996000
+  PatientData | JobId: 13188313-24f2-415f-a282-aa00a12d59de | Timestamp: 2026-02-15 15:13:40.998000

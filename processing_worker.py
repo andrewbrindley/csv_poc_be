@@ -10,7 +10,7 @@ from db_config import (
     get_raw_uploads_collection
 )
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from core_config import TEMPLATES
+from template_utils import get_templates
 
 # --------------------------------------------------------------------------
 # Helper: Process Single Record (Thread-Safe)
@@ -115,7 +115,7 @@ def process_single_record(rec, tenant_id, template_key, job_id, tpl_def):
                     **final_data,
                     "__operation": operation
                 }
-            }}
+            }, "$unset": {"error": ""}}
         )
         return {"status": "success", "operation": operation}
 
@@ -217,7 +217,8 @@ def process_ingestion_jobs():
                         print(f"WORKER: Mismatch! Stage '{stage}' != Upload Template '{template_key}'")
                         continue
                     
-                    tpl_def = TEMPLATES.get(template_key)
+                    all_templates = get_templates(tenant_id)
+                    tpl_def = all_templates.get(template_key)
                     if not tpl_def:
                         print(f"WORKER: Template {template_key} not found")
                         continue
