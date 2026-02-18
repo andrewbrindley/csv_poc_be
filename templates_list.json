@@ -1,0 +1,33 @@
+[
+  {
+    "_id": "6994fafa295f7b2fcb21fff8",
+    "tenantId": "acme-corp",
+    "templateKey": "notes",
+    "templateLabel": "Notes",
+    "keywords": [],
+    "dependencies": [],
+    "references": {},
+    "fields": [
+      {
+        "key": "field1",
+        "label": "NoteID",
+        "pattern": "string",
+        "required": true,
+        "identifier": true,
+        "is_pii": false,
+        "allowed": null,
+        "targetTemplate": null,
+        "targetField": null,
+        "dateFormat": null,
+        "normalize": "",
+        "sequence": null,
+        "description": "The ID of the note.",
+        "mask": "alphanumeric",
+        "synonyms": []
+      }
+    ],
+    "createdAt": "2026-02-17 23:34:18.291000",
+    "updatedAt": "2026-02-17 23:34:18.291000",
+    "createdBy": "unknown"
+  }
+]

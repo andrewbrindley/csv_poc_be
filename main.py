@@ -48,6 +48,7 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 app = Flask(__name__)
 CORS(app, supports_credentials=True, resources={r"/api/*": {"origins": "*"}})
 
+
 # Register REST API Blueprint
 try:
     from api_data import data_bp
@@ -55,6 +56,14 @@ try:
     print("Main: Registered data_bp at /api/v1")
 except Exception as e:
     print(f"Main: Failed to register data_bp: {e}")
+
+# Register Template API Blueprint
+try:
+    from template_api import api_template_bp
+    app.register_blueprint(api_template_bp, url_prefix="/api")
+    print("Main: Registered api_template_bp at /api")
+except Exception as e:
+    print(f"Main: Failed to register api_template_bp: {e}")
 
 # Register GraphQL Endpoint
 try:

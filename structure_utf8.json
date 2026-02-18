@@ -1,0 +1,67 @@
+{
+  "_id": "6991bce0656afd9b2a5a6ed3",
+  "tenantId": "acme-corp",
+  "templateKey": "notesanddocuments",
+  "templateLabel": "Notes and Documents",
+  "keywords": [],
+  "dependencies": [],
+  "references": {},
+  "fields": [
+    {
+      "key": "field1",
+      "label": "PersonID",
+      "pattern": "reference",
+      "required": true,
+      "identifier": false,
+      "is_pii": false,
+      "allowed": null,
+      "targetTemplate": "People",
+      "targetField": "id",
+      "dateFormat": null,
+      "normalize": "",
+      "sequence": null,
+      "synonyms": []
+    },
+    {
+      "key": "col_t5h3kspuk",
+      "label": "DocumentID",
+      "pattern": "integer",
+      "required": true,
+      "identifier": true,
+      "is_pii": false,
+      "allowed": null,
+      "targetTemplate": null,
+      "targetField": null,
+      "dateFormat": null,
+      "normalize": "",
+      "sequence": "+1",
+      "synonyms": []
+    },
+    {
+      "key": "col_tumttia38",
+      "label": "Type",
+      "pattern": "enum",
+      "required": true,
+      "identifier": false,
+      "is_pii": false,
+      "allowed": [
+        "Note",
+        "Document"
+      ],
+      "targetTemplate": null,
+      "targetField": null,
+      "dateFormat": null,
+      "normalize": "",
+      "sequence": null,
+      "synonyms": []
+    }
+  ],
+  "locked": false,
+  "createdAt": {
+    "$date": "2026-02-15T12:32:32.687Z"
+  },
+  "updatedAt": {
+    "$date": "2026-02-16T12:44:33.835Z"
+  },
+  "createdBy": "unknown"
+}

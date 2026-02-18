@@ -1,7 +1,14 @@
-# Template Builder API Endpoints
-# These endpoints allow tenants to create and manage custom templates
 
-@app.route("/api/templates", methods=["GET"])
+from flask import Blueprint, request, jsonify
+from datetime import datetime
+import re
+
+from db_config import get_templates_collection, get_tenant_data_collection
+from core_config import TEMPLATES
+
+api_template_bp = Blueprint('api_template_bp', __name__)
+
+@api_template_bp.route("/templates", methods=["GET"])
 def api_get_templates():
     """Get all templates for a tenant (custom + defaults)."""
     tenant_id = request.args.get("tenantId")
@@ -32,7 +39,7 @@ def api_get_templates():
     return jsonify({"templates": list(all_templates.values())})
 
 
-@app.route("/api/templates", methods=["POST"])
+@api_template_bp.route("/templates", methods=["POST"])
 def api_create_template():
     """Create a new custom template."""
     body = request.get_json(force=True, silent=False) or {}
@@ -87,7 +94,7 @@ def api_create_template():
     return jsonify({"message": "Template created successfully", "template": template_doc}), 201
 
 
-@app.route("/api/templates/<template_key>", methods=["GET"])
+@api_template_bp.route("/templates/<template_key>", methods=["GET"])
 def api_get_template(template_key):
     """Get a single template by key."""
     tenant_id = request.args.get("tenantId")
@@ -118,7 +125,7 @@ def api_get_template(template_key):
     return jsonify({"error": "Template not found"}), 404
 
 
-@app.route("/api/templates/<template_key>", methods=["PUT"])
+@api_template_bp.route("/templates/<template_key>", methods=["PUT"])
 def api_update_template(template_key):
     """Update an existing template."""
     body = request.get_json(force=True, silent=False) or {}
@@ -177,7 +184,7 @@ def api_update_template(template_key):
     return jsonify({"message": "Template updated successfully", "template": updated})
 
 
-@app.route("/api/templates/<template_key>", methods=["DELETE"])
+@api_template_bp.route("/templates/<template_key>", methods=["DELETE"])
 def api_delete_template(template_key):
     """Delete a template (with validation)."""
     tenant_id = request.args.get("tenantId")
@@ -194,8 +201,9 @@ def api_delete_template(template_key):
         return jsonify({"error": f"Template '{template_key}' not found"}), 404
     
     # Check if data exists for this template
+
     coll_data = get_tenant_data_collection()
-    if coll_data:
+    if coll_data is not None:
         data_count = coll_data.count_documents({"tenantId": tenant_id, "templateKey": template_key})
         if data_count > 0:
             return jsonify({
