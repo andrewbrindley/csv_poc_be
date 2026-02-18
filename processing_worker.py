@@ -40,12 +40,32 @@ def process_single_record(rec, tenant_id, template_key, job_id, tpl_def):
             if source_val:
                 # Look up parent
                 # "data.id": "1001", "templateKey": "People", "tenantId": tenant_id
+                
+                # DEBUG REF
+                print(f"WORKER: Resolving ref {field}={source_val} -> {target_tpl}.{target_field}")
+                
+                # Try Lookup (Exact Match)
                 parent = coll_data.find_one({
                     "tenantId": tenant_id,
                     "templateKey": target_tpl,
                     f"data.{target_field}": source_val
                 })
                 
+                # Fallback: Try integer/string conversion if failure (Robustness)
+                if not parent:
+                    try:
+                        alt_val = int(source_val) if isinstance(source_val, str) and source_val.isdigit() else str(source_val)
+                        if alt_val != source_val:
+                             parent = coll_data.find_one({
+                                "tenantId": tenant_id,
+                                "templateKey": target_tpl,
+                                f"data.{target_field}": alt_val
+                            })
+                             if parent:
+                                print(f"WORKER: Soft matched ref {field} using alternate type: {alt_val}")
+                    except Exception:
+                        pass
+
                 if parent:
                     resolved_links[f"_parentRef_{field}"] = {
                         "collection": target_tpl,
@@ -54,7 +74,9 @@ def process_single_record(rec, tenant_id, template_key, job_id, tpl_def):
                     }
                 else:
                     # Strict FK Check: Parent must exist
-                    raise ValueError(f"Foreign Key Violation: Field '{field}' value '{source_val}' not found in {target_tpl}")
+                    err_msg = f"Foreign Key Violation: Field '{field}' value '{source_val}' not found in {target_tpl}"
+                    print(f"WORKER: {err_msg}")
+                    raise ValueError(err_msg)
 
         # 2. Upsert Logic
         # Extract all fields marked with "identifier": True from template.
@@ -73,17 +95,15 @@ def process_single_record(rec, tenant_id, template_key, job_id, tpl_def):
                 val = row_data.get(pk)
                 if val is not None:
                     query[f"data.{pk}"] = val
-                    
+            
+            # Use 'upsert' to create or update
+            # We want to know if it was an insert or update for stats
+            existing_doc = coll_data.find_one(query)
+            operation = "updated" if existing_doc else "created"
+
             # Merge links
             final_data = {**row_data, **resolved_links}
             
-            # Check if record exists to determine operation type
-            # This prevents race condition from separate update calls
-            exists = coll_data.find_one(query) is not None
-            operation = "updated" if exists else "created"
-            # print(f"WORKER: Upsert Logic - Query: {query}, Exists: {exists} -> Operation: {operation}")
-            
-            # Perform upsert with operation tracking in single atomic call
             coll_data.update_one(
                 query,
                 {"$set": {
@@ -105,6 +125,7 @@ def process_single_record(rec, tenant_id, template_key, job_id, tpl_def):
                 "jobId": job_id,
                 "__operation": "created"
             })
+            operation = "created"
 
         # 3. Mark Record Resolved with SNAPSHOT
         coll_records.update_one(
