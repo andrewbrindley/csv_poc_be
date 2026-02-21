@@ -420,7 +420,7 @@ def clean_patient_value(field, raw):
     return clean_generic_string(raw, required)
 
 
-def clean_value(template_key: str, field: dict, raw):
+def clean_value(template_key: str, field: dict, raw, valid_ref_ids: dict = None):
     """
     Main entry point for cleaning and validating a single value.
     Enforces pattern matching (date, integer, enum) and template-specific rules.
@@ -577,6 +577,14 @@ def clean_value(template_key: str, field: dict, raw):
             if s not in allowed and not field.get("allowNew", False):
                 return clean_val, "bad"
 
+        # --- RELATIONSHIP VALIDATION (FK existence check) ---
+        if pattern == "relationship":
+            ref_set = (valid_ref_ids or {}).get(field["key"])
+            if ref_set is not None:
+                # ref_set was pre-fetched from DB; None means no context (skip check)
+                if s not in ref_set:
+                    return clean_val, "bad"  # FK violation: ID not found in parent collection
+
     return clean_val, status
 
 
@@ -663,7 +671,7 @@ def infer_sequential_numeric_ids(template_key: str, rows: list, all_templates: d
     return inferred
 
 
-def clean_rows_for_template(template_key: str, rows: list, all_templates: dict = None):
+def clean_rows_for_template(template_key: str, rows: list, all_templates: dict = None, tenant_id: str = None):
     """
     Algorithmically clean + validate all rows for a given template.
 
@@ -675,6 +683,36 @@ def clean_rows_for_template(template_key: str, rows: list, all_templates: dict =
       inferred_ids: list[...]
     """
     tpl = get_template(template_key, all_templates)
+    refs = tpl.get("references", {})  # built by template_utils.get_templates()
+
+    # Pre-fetch valid IDs for each relationship field in one DB query per reference.
+    # valid_ref_ids: { field_key -> set of valid ID strings } or None if no DB context.
+    valid_ref_ids = {}
+    if tenant_id and refs:
+        try:
+            from db_config import get_tenant_data_collection
+            coll = get_tenant_data_collection()
+            if coll is not None:
+                for field_key, ref_config in refs.items():
+                    target_tpl = ref_config.get("targetTemplate")
+                    target_field = ref_config.get("targetField", "id")
+                    if not target_tpl:
+                        continue
+                    docs = coll.find(
+                        {"tenantId": tenant_id, "templateKey": target_tpl},
+                        {f"data.{target_field}": 1}
+                    )
+                    valid_ref_ids[field_key] = {
+                        str(d["data"][target_field])
+                        for d in docs
+                        if "data" in d and target_field in d["data"]
+                    }
+                    print(f"CLEAN: Pre-fetched {len(valid_ref_ids[field_key])} valid '{target_field}' IDs "
+                          f"from {target_tpl} for field '{field_key}'")
+        except Exception as e:
+            print(f"CLEAN: Warning - could not pre-fetch ref IDs for {template_key}: {e}")
+            valid_ref_ids = {}  # Fall back: skip FK check rather than crash
+
     cleaned_rows = []
     row_errors = {}
 
@@ -691,7 +729,7 @@ def clean_rows_for_template(template_key: str, rows: list, all_templates: dict =
             fkey = field["key"]
             raw_val = row.get(fkey)
 
-            clean_val, status = clean_value(template_key, field, raw_val)
+            clean_val, status = clean_value(template_key, field, raw_val, valid_ref_ids=valid_ref_ids)
 
             # PatientData.blockName default
             if template_key == "PatientData" and fkey == "blockName" and not clean_val:
@@ -1407,7 +1445,16 @@ def enhance_rows_with_ai(
                             if fk in pii_field_keys and not include_pii_in_ai:
                                 out_row[fk] = orig.get(fk, "")
                             else:
-                                out_row[fk] = r.get(fk, "")
+                                if only_fix_invalid:
+                                    # Strict check: If field is valid, keep original value.
+                                    # Handle both int/str keys for row_errors lookup
+                                    bad_fields = row_errors.get(idx) or row_errors.get(str(idx)) or []
+                                    if fk not in bad_fields:
+                                        out_row[fk] = orig.get(fk, "")
+                                    else:
+                                        out_row[fk] = r.get(fk, "")
+                                else:
+                                    out_row[fk] = r.get(fk, "")
                         batch_output.append(out_row)
                 else:
                     # Fallback for this batch
@@ -2147,8 +2194,10 @@ def api_clean_values():
     except ValueError as ex:
         return jsonify({"error": str(ex)}), 400
 
-    # 1) algorithmic clean
-    cleaned_rows_initial, row_errors_initial, inferred_ids_initial = clean_rows_for_template(template_key, rows, all_templates)
+    # 1) algorithmic clean (with FK relationship validation against tenant DB)
+    cleaned_rows_initial, row_errors_initial, inferred_ids_initial = clean_rows_for_template(
+        template_key, rows, all_templates, tenant_id=tenant_id
+    )
 
     # 2) AI pass (optional)
     cleaned_rows = cleaned_rows_initial
@@ -2172,7 +2221,9 @@ def api_clean_values():
             extras=extras,
             include_pii_in_ai=include_pii_in_ai,
         )
-        cleaned_rows, row_errors, inferred_ids = clean_rows_for_template(template_key, cleaned_rows_ai, all_templates)
+        cleaned_rows, row_errors, inferred_ids = clean_rows_for_template(
+            template_key, cleaned_rows_ai, all_templates, tenant_id=tenant_id
+        )
 
     if template_key == "PatientData":
         for r in cleaned_rows:
@@ -2663,6 +2714,134 @@ def api_get_job_records(job_id):
         records.append(doc)
 
     return jsonify({"records": records})
+
+
+@app.route("/api/jobs/<job_id>/trace", methods=["GET"])
+def api_get_job_trace(job_id):
+    """Generate and return a plain-text execution trace log for a job."""
+    from flask import Response
+    coll_jobs = get_ingestion_jobs_collection()
+    coll_records = get_ingestion_records_collection()
+    if coll_jobs is None or coll_records is None:
+        return jsonify({"error": "MongoDB not connected"}), 500
+
+    job = coll_jobs.find_one({"jobId": job_id})
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+
+    tenant_id = job.get("tenantId", "unknown")
+    triggered_at = job.get("triggeredAt")
+    start_ts = triggered_at.isoformat() + "Z" if triggered_at else "unknown"
+
+    # Fetch all records in topological order (by stage then rowIndex)
+    execution_order = job.get("jobPlan", {}).get("executionOrder", [])
+    all_records = list(coll_records.find({"jobId": job_id}).sort("rowIndex", 1))
+
+    # Sort records by executionOrder stage priority then rowIndex
+    def stage_sort_key(rec):
+        tpl = rec.get("templateKey", "")
+        try:
+            return (execution_order.index(tpl), rec.get("rowIndex", 0))
+        except ValueError:
+            return (len(execution_order), rec.get("rowIndex", 0))
+
+    all_records.sort(key=stage_sort_key)
+
+    # Track failed parent IDs per template for cascade detection
+    # Map: templateKey -> set of entity IDs that failed
+    failed_ids = {}  # { templateKey: set(id_value) }
+
+    lines = []
+    total = len(all_records)
+    counts = {"success": 0, "failed": 0, "skipped": 0}
+
+    for seq, rec in enumerate(all_records, start=1):
+        tpl_key = rec.get("templateKey", "?")
+        row_data = rec.get("data", {})
+        status_raw = rec.get("status", "pending")
+        err_msg = rec.get("error", "")
+        processed = rec.get("processedData", {})
+
+        # Determine entity ID (first identifier-like field or rowIndex)
+        entity_id = (
+            row_data.get("id") or row_data.get("bookingRef") or
+            row_data.get("patientId") or str(rec.get("rowIndex", seq))
+        )
+
+        # Determine parent ref (relationship field value)
+        parent_ref = (
+            row_data.get("personNumber") or row_data.get("patientId") or "none"
+        ) if tpl_key != "People" else "none"
+
+        # Determine timestamp for this record
+        rec_ts = rec.get("updatedAt") or rec.get("createdAt") or triggered_at
+        ts_str = rec_ts.strftime("%H:%M:%S.%f")[:12] if hasattr(rec_ts, "strftime") else "??:??:??.???"
+
+        # Check if parent failed → SKIPPED cascade
+        skipped_msg = None
+        if tpl_key != "People" and parent_ref and parent_ref != "none":
+            # Find which template the parent belongs to (first stage dependency)
+            for dep_tpl, failed_set in failed_ids.items():
+                if str(parent_ref) in failed_set:
+                    skipped_msg = f"Parent Entity ({parent_ref}) failed."
+                    break
+
+        if skipped_msg:
+            status_label = "SKIPPED"
+            msg = skipped_msg
+            counts["skipped"] += 1
+        elif status_raw == "resolved":
+            op = processed.get("__operation", "updated")
+            status_label = "SUCCESS"
+            msg = "Insert complete." if op == "created" else "Upsert complete."
+            counts["success"] += 1
+        elif status_raw == "error":
+            status_label = "FAILED "
+            msg = err_msg or "Unknown error."
+            counts["failed"] += 1
+            # Track this as a failed parent for cascade detection
+            if tpl_key not in failed_ids:
+                failed_ids[tpl_key] = set()
+            failed_ids[tpl_key].add(str(entity_id))
+        else:
+            status_label = "PENDING"
+            msg = "Not yet processed."
+
+        line = (
+            f"[{seq:03d}] [{ts_str}] [{status_label}] {tpl_key:<12} | "
+            f"ID: {str(entity_id):<8} | REF: {str(parent_ref):<8} | MSG: {msg}"
+        )
+        lines.append(line)
+
+    SEP = "=" * 70
+    header = "\n".join([
+        SEP,
+        "JOB EXECUTION TRACE",
+        SEP,
+        f"Job ID:      {job_id}",
+        f"Tenant:      {tenant_id}",
+        f"Start Time:  {start_ts}",
+        f"Records:     {total}",
+        SEP,
+        "",
+    ])
+    body = "\n".join(lines)
+    footer = "\n".join([
+        "",
+        SEP,
+        f"SUMMARY: {total} Attempted | {counts['success']} Success | {counts['failed']} Failed | {counts['skipped']} Skipped",
+        SEP,
+        "",
+    ])
+
+    log_text = header + body + footer
+
+    filename = f"job_trace_{job_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    return Response(
+        log_text,
+        mimetype="text/plain",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
 
 
 
