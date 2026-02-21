@@ -1,5 +1,4 @@
 
-
 import threading
 import time
 from datetime import datetime
@@ -11,6 +10,8 @@ from db_config import (
 )
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from template_utils import get_templates
+from webhook_manager import fire_webhooks
+
 
 # --------------------------------------------------------------------------
 # Helper: Process Single Record (Thread-Safe)
@@ -305,8 +306,27 @@ def process_ingestion_jobs():
                 )
                 print(f"WORKER: Job {job_id} finished with status {final_status}. Aggregate Stats: {aggregate_stats}")
 
+                # Fire outbound webhooks (non-blocking — runs in daemon threads)
+                completed_job_snapshot = {
+                    **job,
+                    "status": final_status,
+                    "completedAt": datetime.now(),
+                    "metrics": {
+                        "totalRecords": aggregate_stats["created"] + aggregate_stats["updated"] + aggregate_stats["errors"],
+                        "created": aggregate_stats["created"],
+                        "updated": aggregate_stats["updated"],
+                        "errors": aggregate_stats["errors"],
+                    },
+                }
+                threading.Thread(
+                    target=fire_webhooks,
+                    args=(tenant_id, completed_job_snapshot),
+                    daemon=True
+                ).start()
+
             time.sleep(2) # Poll interval
             
         except Exception as e:
             print(f"WORKER CRASH: {e}")
             time.sleep(5)
+

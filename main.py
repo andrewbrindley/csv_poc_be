@@ -33,10 +33,60 @@ from db_config import (
     get_imports_collection, 
     get_tenant_data_collection, 
     get_raw_uploads_collection, 
-    get_ingestion_jobs_collection,
-    get_ingestion_records_collection,
-    get_templates_collection
+    get_ingestion_jobs_collection, 
+    get_ingestion_records_collection, 
+    get_templates_collection, 
+    get_webhooks_collection,
+    get_users_collection
 )
+from auth_utils import (
+    require_auth, 
+    require_role, 
+    ROLE_ADMIN, 
+    ROLE_EDITOR, 
+    ROLE_VIEWER,
+    get_current_user_id
+)
+
+def seed_users():
+    """Seed default users for testing RBAC if the collection is empty."""
+    coll = get_users_collection()
+    if coll is None:
+        return
+    
+    if coll.count_documents({}) == 0:
+        print("AUTH: Seeding default users...")
+        users = [
+            {
+                "userId": "admin-1",
+                "name": "Global Admin",
+                "tenants": [
+                    {"tenantId": "acme-corp", "role": ROLE_ADMIN},
+                    {"tenantId": "globex", "role": ROLE_ADMIN},
+                    {"tenantId": "stark-ind", "role": ROLE_ADMIN},
+                ]
+            },
+            {
+                "userId": "editor-1",
+                "name": "Acme Editor",
+                "tenants": [
+                    {"tenantId": "acme-corp", "role": ROLE_EDITOR}
+                ]
+            },
+            {
+                "userId": "viewer-1",
+                "name": "Acme Viewer",
+                "tenants": [
+                    {"tenantId": "acme-corp", "role": ROLE_VIEWER}
+                ]
+            }
+        ]
+        coll.insert_many(users)
+        print(f"AUTH: Inserted {len(users)} default users.")
+
+# Seed on import
+seed_users()
+
 
 # --------------------------------------------------------------------------
 # Config
@@ -2152,16 +2202,66 @@ def api_ai_detect_and_map():
     })
 
 
+# --------------------------------------------------------------------------
+# Auth Endpoints
+# --------------------------------------------------------------------------
+
+@app.route("/api/auth/login", methods=["POST"])
+def api_login():
+    """Simple login that returns user document from DB."""
+    body = request.get_json(force=True, silent=True) or {}
+    user_id = body.get("userId")
+    
+    if not user_id:
+        return jsonify({"error": "userId is required"}), 400
+    
+    coll = get_users_collection()
+    user = coll.find_one({"userId": user_id})
+    
+    if not user:
+        return jsonify({"error": "Invalid user ID"}), 401
+    
+    user["_id"] = str(user["_id"])
+    return jsonify({"user": user})
+
+@app.route("/api/auth/me", methods=["GET"])
+@require_auth
+def api_get_me():
+    """Return current user info based on X-User-ID header."""
+    user = getattr(request, 'user', None)
+    if user:
+        user["_id"] = str(user["_id"])
+    return jsonify({"user": user})
+
+
 @app.route("/api/tenants", methods=["GET"])
+@require_auth
 def api_get_tenants():
-    """Return a list of available tenants."""
-    # In a real app, this might come from a DB. For now, we mock it.
+    """Return a list of available tenants for the current user."""
+    """List all available tenants for the current user."""
+    # We use get_current_user_id() from auth_utils
+    user_id = get_current_user_id()
+    user = getattr(request, 'user', None) # require_auth attaches it
+    
+    # Static list for POC
     tenants = [
         {"id": "acme-corp", "name": "Acme Corp"},
-        {"id": "globex", "name": "Globex Corporation"},
-        {"id": "stark-ind", "name": "Stark Industries"},
+        {"id": "globex", "name": "Globex Corp"},
+        {"id": "stark-ind", "name": "Stark Industries"}
     ]
-    return jsonify({"tenants": tenants})
+
+    # If super admin, return all
+    if user_id == "admin-1":
+        return jsonify({"tenants": tenants})
+
+    # Otherwise filter by user association
+    if not user:
+        return jsonify({"tenants": []})
+        
+    accessible_ids = [t.get("tenantId") for t in user.get("tenants", [])]
+    accessible = [t for t in tenants if t["id"] in accessible_ids]
+            
+    return jsonify({"tenants": accessible})
 
 
 
@@ -2336,6 +2436,7 @@ def api_import_dump():
 
 
 @app.route("/api/import/trigger-job", methods=["POST"])
+@require_role(ROLE_EDITOR)
 def api_import_trigger_job():
     """Trigger an ingestion job for MULTIPLE dumped uploads with dependency-aware planning."""
     body = request.get_json(force=True, silent=False) or {}
@@ -2641,6 +2742,7 @@ def api_get_data():
 
 
 @app.route("/api/jobs", methods=["GET"])
+@require_role(ROLE_VIEWER)
 def api_list_jobs():
     """List ingestion jobs for a tenant."""
     tenant_id = request.args.get("tenantId")
@@ -2674,6 +2776,7 @@ def api_list_jobs():
 
 
 @app.route("/api/jobs/<job_id>", methods=["GET"])
+@require_role(ROLE_VIEWER)
 def api_get_job(job_id):
     """Get full details/plan for a specific job."""
     coll_jobs = get_ingestion_jobs_collection()
@@ -2694,6 +2797,7 @@ def api_get_job(job_id):
 
 
 @app.route("/api/jobs/<job_id>/records", methods=["GET"])
+@require_role(ROLE_VIEWER)
 def api_get_job_records(job_id):
     """Get row-level records for a job."""
     coll_records = get_ingestion_records_collection()
@@ -2717,7 +2821,8 @@ def api_get_job_records(job_id):
 
 
 @app.route("/api/jobs/<job_id>/trace", methods=["GET"])
-def api_get_job_trace(job_id):
+@require_role(ROLE_VIEWER)
+def api_download_job_trace(job_id):
     """Generate and return a plain-text execution trace log for a job."""
     from flask import Response
     coll_jobs = get_ingestion_jobs_collection()
@@ -2846,10 +2951,146 @@ def api_get_job_trace(job_id):
 
 
 # --------------------------------------------------------------------------
+# Webhook API Endpoints
+# --------------------------------------------------------------------------
+
+@app.route("/api/webhooks", methods=["GET"])
+@require_role(ROLE_ADMIN)
+def api_list_webhooks():
+    """List all webhooks for a tenant."""
+    tenant_id = request.args.get("tenantId")
+    if not tenant_id:
+        return jsonify({"error": "tenantId is required"}), 400
+
+    coll = get_webhooks_collection()
+    if coll is None:
+        return jsonify({"error": "MongoDB not connected"}), 500
+
+    docs = list(coll.find({"tenantId": tenant_id}).sort("createdAt", 1))
+    for d in docs:
+        d["_id"] = str(d["_id"])
+        if d.get("createdAt"):
+            d["createdAt"] = d["createdAt"].isoformat() + "Z"
+        if d.get("updatedAt"):
+            d["updatedAt"] = d["updatedAt"].isoformat() + "Z"
+
+    return jsonify({"webhooks": docs})
+
+
+@app.route("/api/webhooks", methods=["POST"])
+@require_role(ROLE_ADMIN)
+def api_create_webhook():
+    """Create a new webhook for a tenant."""
+    body = request.get_json(force=True, silent=True) or {}
+    tenant_id = body.get("tenantId")
+    url = (body.get("url") or "").strip()
+    name = (body.get("name") or url).strip()
+
+    if not tenant_id:
+        return jsonify({"error": "tenantId is required"}), 400
+    if not url:
+        return jsonify({"error": "url is required"}), 400
+
+    coll = get_webhooks_collection()
+    if coll is None:
+        return jsonify({"error": "MongoDB not connected"}), 500
+
+    now = datetime.utcnow()
+    webhook_id = str(uuid.uuid4())
+    doc = {
+        "webhookId": webhook_id,
+        "tenantId": tenant_id,
+        "name": name,
+        "url": url,
+        "active": bool(body.get("active", True)),
+        "entityTypes": body.get("entityTypes") or [],
+        "oauth": {
+            "enabled": bool((body.get("oauth") or {}).get("enabled", False)),
+            "tokenUrl": ((body.get("oauth") or {}).get("tokenUrl") or "").strip(),
+            "clientId": ((body.get("oauth") or {}).get("clientId") or "").strip(),
+            "clientSecret": ((body.get("oauth") or {}).get("clientSecret") or "").strip(),
+            "scope": ((body.get("oauth") or {}).get("scope") or "").strip(),
+        },
+        "createdAt": now,
+        "updatedAt": now,
+    }
+    coll.insert_one(doc)
+    doc["_id"] = str(doc["_id"])
+    doc["createdAt"] = now.isoformat() + "Z"
+    doc["updatedAt"] = now.isoformat() + "Z"
+
+    return jsonify({"message": "Webhook created", "webhook": doc}), 201
+
+
+@app.route("/api/webhooks/<webhook_id>", methods=["PUT"])
+@require_role(ROLE_ADMIN)
+def api_update_webhook(webhook_id):
+    """Update an existing webhook."""
+    body = request.get_json(force=True, silent=True) or {}
+
+    coll = get_webhooks_collection()
+    if coll is None:
+        return jsonify({"error": "MongoDB not connected"}), 500
+
+    existing = coll.find_one({"webhookId": webhook_id})
+    if not existing:
+        return jsonify({"error": "Webhook not found"}), 404
+
+    now = datetime.utcnow()
+    updates = {"updatedAt": now}
+
+    if "name" in body:
+        updates["name"] = (body["name"] or "").strip()
+    if "url" in body:
+        url = (body["url"] or "").strip()
+        if not url:
+            return jsonify({"error": "url cannot be empty"}), 400
+        updates["url"] = url
+    if "active" in body:
+        updates["active"] = bool(body["active"])
+    if "entityTypes" in body:
+        updates["entityTypes"] = body["entityTypes"] or []
+    if "oauth" in body:
+        oauth_in = body["oauth"] or {}
+        updates["oauth"] = {
+            "enabled": bool(oauth_in.get("enabled", False)),
+            "tokenUrl": (oauth_in.get("tokenUrl") or "").strip(),
+            "clientId": (oauth_in.get("clientId") or "").strip(),
+            "clientSecret": (oauth_in.get("clientSecret") or "").strip(),
+            "scope": (oauth_in.get("scope") or "").strip(),
+        }
+
+    coll.update_one({"webhookId": webhook_id}, {"$set": updates})
+    updated = coll.find_one({"webhookId": webhook_id})
+    updated["_id"] = str(updated["_id"])
+    if updated.get("createdAt"):
+        updated["createdAt"] = updated["createdAt"].isoformat() + "Z"
+    updated["updatedAt"] = now.isoformat() + "Z"
+
+    return jsonify({"message": "Webhook updated", "webhook": updated})
+
+
+@app.route("/api/webhooks/<webhook_id>", methods=["DELETE"])
+@require_role(ROLE_ADMIN)
+def api_delete_webhook(webhook_id):
+    """Delete a webhook."""
+    coll = get_webhooks_collection()
+    if coll is None:
+        return jsonify({"error": "MongoDB not connected"}), 500
+
+    result = coll.delete_one({"webhookId": webhook_id})
+    if result.deleted_count == 0:
+        return jsonify({"error": "Webhook not found"}), 404
+
+    return jsonify({"message": "Webhook deleted"})
+
+
+# --------------------------------------------------------------------------
 # Template Builder API Endpoints
 # --------------------------------------------------------------------------
 
 @app.route("/api/templates", methods=["GET"])
+@require_role(ROLE_VIEWER) # Viewers can see templates
 def api_get_templates():
     """Get all templates for a tenant (custom + defaults)."""
     tenant_id = request.args.get("tenantId")
@@ -2884,7 +3125,8 @@ def api_get_templates():
 
 
 @app.route("/api/templates", methods=["POST"])
-def api_create_template():
+@require_role(ROLE_ADMIN)
+def api_save_template():
     """Create a new custom template."""
     body = request.get_json(force=True, silent=False) or {}
     tenant_id = body.get("tenantId")

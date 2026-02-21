@@ -79,3 +79,17 @@ def get_templates_collection():
     if db is None:
         return None
     return db["templates"]
+
+def get_webhooks_collection():
+    """Get the webhooks collection for per-tenant webhook configurations."""
+    db = get_db()
+    if db is None:
+        return None
+    return db["webhooks"]
+
+def get_users_collection():
+    """Get the users collection for RBAC."""
+    db = get_db()
+    if db is None:
+        return None
+    return db["users"]

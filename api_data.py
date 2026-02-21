@@ -4,6 +4,7 @@ from datetime import datetime
 from db_config import get_tenant_data_collection, get_templates_collection
 from bson import ObjectId
 import re
+from auth_utils import require_role, ROLE_VIEWER, ROLE_EDITOR
 
 # Fallback templates from main (circular import avoidance: we might need to refactor if main imports this)
 # Better to pass distinct templates or import from a shared module.
@@ -50,6 +51,7 @@ def resolve_template_key(tenant_id, resource_name):
     return None, None
 
 @data_bp.route("/<tenant_id>/<resource_name>", methods=["GET"])
+@require_role(ROLE_VIEWER)
 def list_resources(tenant_id, resource_name):
     template_key, tpl_def = resolve_template_key(tenant_id, resource_name)
     if not template_key:
@@ -122,6 +124,7 @@ def list_resources(tenant_id, resource_name):
     })
 
 @data_bp.route("/<tenant_id>/<resource_name>/<id>", methods=["GET"])
+@require_role(ROLE_VIEWER)
 def get_resource(tenant_id, resource_name, id):
     template_key, _ = resolve_template_key(tenant_id, resource_name)
     if not template_key:
@@ -159,6 +162,7 @@ def get_resource(tenant_id, resource_name, id):
     return jsonify(item)
 
 @data_bp.route("/<tenant_id>/<resource_name>", methods=["POST"])
+@require_role(ROLE_EDITOR)
 def create_resource(tenant_id, resource_name):
     template_key, tpl_def = resolve_template_key(tenant_id, resource_name)
     if not template_key:
