@@ -3026,7 +3026,7 @@ def api_rollback_job(job_id):
         coll_records = get_ingestion_records_collection()
         coll_data    = get_tenant_data_collection()
 
-        if not all([coll_jobs, coll_records, coll_data]):
+        if coll_jobs is None or coll_records is None or coll_data is None:
             return jsonify({"error": "DB unavailable"}), 503
 
         # Verify job belongs to this tenant and is in a rollback-able state

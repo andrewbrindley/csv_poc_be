@@ -39,7 +39,7 @@ def resolve_template_key(tenant_id, resource_name):
     
     # 2. Try DB templates
     coll_templates = get_templates_collection()
-    if coll_templates:
+    if coll_templates is not None:
         # Case-insensitive search using regex
         # This allows "custom_form" to match "Custom_Form"
         tpl = coll_templates.find_one({
