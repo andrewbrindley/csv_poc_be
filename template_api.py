@@ -5,12 +5,28 @@ import re
 
 from db_config import get_templates_collection, get_tenant_data_collection
 from core_config import TEMPLATES
+from auth_utils import get_current_user_id
+from audit_logger import log_audit_event
 
 api_template_bp = Blueprint('api_template_bp', __name__)
 
 @api_template_bp.route("/templates", methods=["GET"])
 def api_get_templates():
-    """Get all templates for a tenant (custom + defaults)."""
+    """
+    Get all templates for a tenant (custom + defaults).
+    ---
+    tags:
+      - Templates
+    parameters:
+      - in: query
+        name: tenantId
+        type: string
+        required: true
+        description: The ID of the tenant.
+    responses:
+      200:
+        description: A list of templates.
+    """
     tenant_id = request.args.get("tenantId")
     if not tenant_id:
         return jsonify({"error": "tenantId is required"}), 400
@@ -41,7 +57,24 @@ def api_get_templates():
 
 @api_template_bp.route("/templates", methods=["POST"])
 def api_create_template():
-    """Create a new custom template."""
+    """
+    Create a new custom template.
+    ---
+    tags:
+      - Templates
+    parameters:
+      - in: body
+        name: body
+        schema:
+          type: object
+        required: true
+        description: Template metadata and fields.
+    responses:
+      201:
+        description: Template created successfully.
+      400:
+        description: Invalid request.
+    """
     body = request.get_json(force=True, silent=False) or {}
     tenant_id = body.get("tenantId")
     template_key = body.get("templateKey")
@@ -91,12 +124,35 @@ def api_create_template():
     template_doc["createdAt"] = template_doc["createdAt"].isoformat() + "Z"
     template_doc["updatedAt"] = template_doc["updatedAt"].isoformat() + "Z"
     
+    log_audit_event(tenant_id, get_current_user_id(), "TEMPLATE_CREATED", template_doc["_id"], {"templateKey": template_key})
+    
     return jsonify({"message": "Template created successfully", "template": template_doc}), 201
 
 
 @api_template_bp.route("/templates/<template_key>", methods=["GET"])
 def api_get_template(template_key):
-    """Get a single template by key."""
+    """
+    Get a single template by key.
+    ---
+    tags:
+      - Templates
+    parameters:
+      - in: path
+        name: template_key
+        type: string
+        required: true
+        description: The key of the template.
+      - in: query
+        name: tenantId
+        type: string
+        required: true
+        description: The ID of the tenant.
+    responses:
+      200:
+        description: The requested template.
+      404:
+        description: Template not found.
+    """
     tenant_id = request.args.get("tenantId")
     if not tenant_id:
         return jsonify({"error": "tenantId is required"}), 400
@@ -181,6 +237,8 @@ def api_update_template(template_key):
     if "updatedAt" in updated:
         updated["updatedAt"] = updated["updatedAt"].isoformat() + "Z"
     
+    log_audit_event(tenant_id, get_current_user_id(), "TEMPLATE_UPDATED", updated["_id"], {"templateKey": template_key})
+        
     return jsonify({"message": "Template updated successfully", "template": updated})
 
 
@@ -210,7 +268,10 @@ def api_delete_template(template_key):
                 "error": f"Cannot delete template '{template_key}' because {data_count} records exist. Delete the data first."
             }), 409
     
+    target_id = str(existing["_id"])
     # Delete template
     coll_templates.delete_one({"tenantId": tenant_id, "templateKey": template_key})
+    
+    log_audit_event(tenant_id, get_current_user_id(), "TEMPLATE_DELETED", target_id, {"templateKey": template_key})
     
     return jsonify({"message": f"Template '{template_key}' deleted successfully"})

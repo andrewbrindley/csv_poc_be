@@ -1,0 +1,580 @@
+﻿[
+    {
+        "fields":  [
+                       {
+                           "allowed":  [
+                                           "Candidate",
+                                           "Employee"
+                                       ],
+                           "description":  "The category of the person record.",
+                           "examples":  [
+                                            "Candidate",
+                                            "Employee"
+                                        ],
+                           "identifier":  false,
+                           "is_pii":  false,
+                           "key":  "type",
+                           "label":  "Type",
+                           "pattern":  "enum",
+                           "required":  true,
+                           "synonyms":  [
+                                            "candidate type",
+                                            "employee type",
+                                            "person type",
+                                            "role type"
+                                        ]
+                       },
+                       {
+                           "allowed":  null,
+                           "description":  "The unique numeric identifier for the candidate or employee.",
+                           "examples":  [
+                                            "1001",
+                                            "54022",
+                                            "883"
+                                        ],
+                           "identifier":  true,
+                           "is_pii":  true,
+                           "key":  "id",
+                           "label":  "Candidate/Employee No",
+                           "pattern":  "integer",
+                           "required":  true,
+                           "sequence":  "+1",
+                           "synonyms":  [
+                                            "employee no",
+                                            "employee number",
+                                            "candidate number",
+                                            "emp no",
+                                            "emp#",
+                                            "person id"
+                                        ]
+                       },
+                       {
+                           "allowed":  [
+                                           "Mr",
+                                           "Ms",
+                                           "Mrs",
+                                           "Miss",
+                                           "Dr"
+                                       ],
+                           "description":  "The person\u0027s salutation or title.",
+                           "examples":  [
+                                            "Mr",
+                                            "Mrs",
+                                            "Dr",
+                                            "Ms"
+                                        ],
+                           "identifier":  false,
+                           "is_pii":  true,
+                           "key":  "title",
+                           "label":  "Title",
+                           "normalize":  "titlecase",
+                           "required":  true,
+                           "synonyms":  [
+                                            "salutation",
+                                            "honorific"
+                                        ]
+                       },
+                       {
+                           "allowed":  null,
+                           "description":  "The person\u0027s given name.",
+                           "examples":  [
+                                            "John",
+                                            "Sarah",
+                                            "Michael"
+                                        ],
+                           "identifier":  false,
+                           "is_pii":  true,
+                           "key":  "firstName",
+                           "label":  "First Name",
+                           "normalize":  "titlecase",
+                           "required":  true,
+                           "synonyms":  [
+                                            "firstname",
+                                            "given name",
+                                            "forename",
+                                            "name first"
+                                        ]
+                       },
+                       {
+                           "allowed":  null,
+                           "description":  "The person\u0027s family name or surname.",
+                           "examples":  [
+                                            "Smith",
+                                            "Jones",
+                                            "O\u0027Connor"
+                                        ],
+                           "identifier":  false,
+                           "is_pii":  true,
+                           "key":  "surname",
+                           "label":  "Surname",
+                           "normalize":  "titlecase",
+                           "required":  true,
+                           "synonyms":  [
+                                            "last name",
+                                            "family name",
+                                            "lastname"
+                                        ]
+                       },
+                       {
+                           "allowed":  [
+                                           "M",
+                                           "F",
+                                           "Male",
+                                           "Female",
+                                           "Other"
+                                       ],
+                           "description":  "The biological sex or gender identity.",
+                           "examples":  [
+                                            "M",
+                                            "F",
+                                            "Male",
+                                            "Female"
+                                        ],
+                           "identifier":  false,
+                           "is_pii":  true,
+                           "key":  "gender",
+                           "label":  "Gender",
+                           "pattern":  "enum",
+                           "required":  true,
+                           "synonyms":  [
+                                            "sex"
+                                        ]
+                       },
+                       {
+                           "allowed":  null,
+                           "dateFormat":  "DD-MM-YYYY",
+                           "description":  "The person\u0027s date of birth.",
+                           "examples":  [
+                                            "25-12-1980",
+                                            "01-05-1995"
+                                        ],
+                           "identifier":  false,
+                           "is_pii":  true,
+                           "key":  "dob",
+                           "label":  "DOB",
+                           "pattern":  "date",
+                           "required":  true,
+                           "synonyms":  [
+                                            "date of birth",
+                                            "birthdate",
+                                            "birth date"
+                                        ]
+                       },
+                       {
+                           "allowed":  null,
+                           "description":  "The person\u0027s contact email address.",
+                           "examples":  [
+                                            "john.smith@example.com",
+                                            "sarah.j@company.org"
+                                        ],
+                           "identifier":  false,
+                           "is_pii":  true,
+                           "key":  "email",
+                           "label":  "Email",
+                           "normalize":  "email",
+                           "pattern":  "email",
+                           "required":  true,
+                           "synonyms":  [
+                                            "email address",
+                                            "e-mail",
+                                            "mail"
+                                        ]
+                       }
+                   ],
+        "key":  "People",
+        "keywords":  [
+                         "firstname",
+                         "surname",
+                         "employee",
+                         "candidate",
+                         "dob",
+                         "email",
+                         "gender"
+                     ],
+        "label":  "People (Candidates/Employees)"
+    },
+    {
+        "fields":  [
+                       {
+                           "allowed":  null,
+                           "description":  "Unique identifier for the booking appointment.",
+                           "examples":  [
+                                            "BK-1001",
+                                            "APT-992"
+                                        ],
+                           "identifier":  true,
+                           "is_pii":  false,
+                           "key":  "bookingRef",
+                           "label":  "Booking Reference",
+                           "pattern":  "string",
+                           "required":  true,
+                           "synonyms":  [
+                                            "booking ref",
+                                            "booking id",
+                                            "appt ref",
+                                            "reference",
+                                            "ref"
+                                        ]
+                       },
+                       {
+                           "allowed":  null,
+                           "description":  "Numeric ID of the person being assessed.",
+                           "examples":  [
+                                            "1001",
+                                            "54022"
+                                        ],
+                           "identifier":  true,
+                           "is_pii":  true,
+                           "key":  "personNumber",
+                           "label":  "Candidate/Employee No",
+                           "pattern":  "relationship",
+                           "relationship":  {
+                                                "targetField":  "id",
+                                                "targetTemplate":  "People"
+                                            },
+                           "required":  true,
+                           "synonyms":  [
+                                            "employee no",
+                                            "person no",
+                                            "candidate no",
+                                            "emp no",
+                                            "emp#",
+                                            "person id"
+                                        ]
+                       },
+                       {
+                           "allowed":  null,
+                           "description":  "Text, Title Case",
+                           "identifier":  false,
+                           "is_pii":  false,
+                           "key":  "assessmentName",
+                           "label":  "Assessment Name",
+                           "normalize":  "titlecase",
+                           "pattern":  "string",
+                           "required":  true,
+                           "synonyms":  [
+                                            "assessment",
+                                            "exam name",
+                                            "panel",
+                                            "service"
+                                        ]
+                       },
+                       {
+                           "allowed":  null,
+                           "dateFormat":  "DD-MM-YYYY",
+                           "description":  "The date the assessment took place.",
+                           "examples":  [
+                                            "25-12-2025",
+                                            "01-05-2026"
+                                        ],
+                           "identifier":  false,
+                           "is_pii":  false,
+                           "key":  "assessmentDate",
+                           "label":  "Assessment Date",
+                           "pattern":  "date",
+                           "required":  true,
+                           "synonyms":  [
+                                            "appt date",
+                                            "booking date",
+                                            "date"
+                                        ]
+                       },
+                       {
+                           "allowed":  null,
+                           "description":  "Text, Title Case",
+                           "identifier":  false,
+                           "is_pii":  false,
+                           "key":  "locationName",
+                           "label":  "Location",
+                           "normalize":  "titlecase",
+                           "pattern":  "string",
+                           "required":  true,
+                           "synonyms":  [
+                                            "clinic",
+                                            "site",
+                                            "venue",
+                                            "location"
+                                        ]
+                       },
+                       {
+                           "allowed":  null,
+                           "description":  "Text, Title Case",
+                           "identifier":  false,
+                           "is_pii":  false,
+                           "key":  "providerName",
+                           "label":  "Provider Name",
+                           "normalize":  "titlecase",
+                           "pattern":  "string",
+                           "required":  true,
+                           "synonyms":  [
+                                            "provider",
+                                            "doctor",
+                                            "clinician",
+                                            "supplier"
+                                        ]
+                       },
+                       {
+                           "allowed":  [
+                                           "Pending",
+                                           "Booked",
+                                           "Completed",
+                                           "Cancelled"
+                                       ],
+                           "description":  "The current status of the booking.",
+                           "identifier":  false,
+                           "is_pii":  false,
+                           "key":  "status",
+                           "label":  "Booking Status",
+                           "pattern":  "enum",
+                           "required":  false,
+                           "synonyms":  [
+                                            "status",
+                                            "booking status",
+                                            "appt status"
+                                        ]
+                       }
+                   ],
+        "key":  "Bookings",
+        "keywords":  [
+                         "booking",
+                         "appointment",
+                         "assessment",
+                         "date",
+                         "time",
+                         "location",
+                         "clinic",
+                         "provider"
+                     ],
+        "label":  "Bookings (Assessment Appointments)"
+    },
+    {
+        "fields":  [
+                       {
+                           "allowed":  null,
+                           "description":  "Unique numeric ID for the patient.",
+                           "examples":  [
+                                            "1001",
+                                            "54022"
+                                        ],
+                           "identifier":  true,
+                           "is_pii":  true,
+                           "key":  "patientId",
+                           "label":  "Candidate/Employee No",
+                           "pattern":  "relationship",
+                           "relationship":  {
+                                                "targetField":  "id",
+                                                "targetTemplate":  "People"
+                                            },
+                           "required":  true,
+                           "sequence":  "+1",
+                           "synonyms":  [
+                                            "employee no",
+                                            "employee number",
+                                            "candidate number",
+                                            "patient number",
+                                            "emp no",
+                                            "emp#"
+                                        ]
+                       },
+                       {
+                           "allowed":  null,
+                           "description":  "Text, Title Case",
+                           "identifier":  false,
+                           "is_pii":  false,
+                           "key":  "assessmentName",
+                           "label":  "Assessment Name",
+                           "normalize":  "titlecase",
+                           "pattern":  "string",
+                           "required":  true,
+                           "synonyms":  [
+                                            "assessment",
+                                            "exam name",
+                                            "panel",
+                                            "service"
+                                        ]
+                       },
+                       {
+                           "allowed":  null,
+                           "description":  "The block or stream (optional).",
+                           "examples":  [
+                                            "Block A",
+                                            "Stream 1"
+                                        ],
+                           "identifier":  false,
+                           "is_pii":  false,
+                           "key":  "blockName",
+                           "label":  "Block",
+                           "normalize":  "titlecase",
+                           "pattern":  "string",
+                           "required":  false,
+                           "synonyms":  [
+                                            "block",
+                                            "panel",
+                                            "stream",
+                                            "section"
+                                        ]
+                       },
+                       {
+                           "allowed":  null,
+                           "description":  "Text, Title Case",
+                           "identifier":  false,
+                           "is_pii":  false,
+                           "key":  "tests",
+                           "label":  "Tests",
+                           "normalize":  "titlecase",
+                           "pattern":  "string",
+                           "required":  true,
+                           "synonyms":  [
+                                            "tests",
+                                            "test panel",
+                                            "procedures",
+                                            "services"
+                                        ]
+                       },
+                       {
+                           "allowed":  [
+                                           "Pending",
+                                           "In Progress",
+                                           "Completed",
+                                           "Cancelled"
+                                       ],
+                           "description":  "The current status of the assessment.",
+                           "identifier":  false,
+                           "is_pii":  false,
+                           "key":  "status",
+                           "label":  "Status",
+                           "pattern":  "enum",
+                           "required":  true,
+                           "synonyms":  [
+                                            "status",
+                                            "result status",
+                                            "progress"
+                                        ]
+                       },
+                       {
+                           "allowed":  null,
+                           "description":  "Any clinical remarks or comments.",
+                           "examples":  [
+                                            "Patient arrived late",
+                                            "Requires follow-up"
+                                        ],
+                           "identifier":  false,
+                           "is_pii":  true,
+                           "key":  "notes",
+                           "label":  "Clinical Notes",
+                           "pattern":  "string",
+                           "required":  false,
+                           "synonyms":  [
+                                            "notes",
+                                            "comments",
+                                            "clinical notes",
+                                            "remarks"
+                                        ]
+                       }
+                   ],
+        "key":  "PatientData",
+        "keywords":  [
+                         "patient",
+                         "candidate",
+                         "employee",
+                         "assessment",
+                         "test",
+                         "block",
+                         "status",
+                         "notes"
+                     ],
+        "label":  "Patient Data"
+    },
+    {
+        "_id":  "6994fafa295f7b2fcb21fff8",
+        "createdAt":  "2026-02-17T23:34:18.291000Z",
+        "createdBy":  "unknown",
+        "dependencies":  [
+
+                         ],
+        "fields":  [
+                       {
+                           "allowed":  null,
+                           "dateFormat":  null,
+                           "description":  "The ID of the note.",
+                           "identifier":  true,
+                           "is_pii":  false,
+                           "key":  "field1",
+                           "label":  "NoteID",
+                           "mask":  "alphanumeric",
+                           "normalize":  "",
+                           "pattern":  "string",
+                           "required":  true,
+                           "sequence":  null,
+                           "synonyms":  [
+
+                                        ],
+                           "targetField":  null,
+                           "targetTemplate":  null
+                       },
+                       {
+                           "allowed":  null,
+                           "dateFormat":  null,
+                           "identifier":  false,
+                           "is_pii":  false,
+                           "key":  "col_zczu2hb1p",
+                           "label":  "PersonID",
+                           "normalize":  "",
+                           "pattern":  "reference",
+                           "required":  true,
+                           "sequence":  null,
+                           "synonyms":  [
+
+                                        ],
+                           "targetField":  "id",
+                           "targetTemplate":  "People"
+                       },
+                       {
+                           "allowed":  null,
+                           "dateFormat":  null,
+                           "description":  "The actual content of the note itself",
+                           "identifier":  false,
+                           "is_pii":  true,
+                           "key":  "col_ihr64md29",
+                           "label":  "Content",
+                           "normalize":  "",
+                           "pattern":  "string",
+                           "required":  true,
+                           "sequence":  null,
+                           "synonyms":  [
+
+                                        ],
+                           "targetField":  null,
+                           "targetTemplate":  null
+                       },
+                       {
+                           "allowed":  null,
+                           "dateFormat":  null,
+                           "description":  "The person that wrote the note",
+                           "identifier":  false,
+                           "is_pii":  true,
+                           "key":  "col_tzkqwefb1",
+                           "label":  "Author",
+                           "normalize":  "",
+                           "pattern":  "string",
+                           "required":  false,
+                           "sequence":  null,
+                           "synonyms":  [
+
+                                        ],
+                           "targetField":  null,
+                           "targetTemplate":  null
+                       }
+                   ],
+        "keywords":  [
+
+                     ],
+        "references":  {
+
+                       },
+        "templateKey":  "notes",
+        "templateLabel":  "Notes",
+        "tenantId":  "acme-corp",
+        "updatedAt":  "2026-02-22T10:44:03.139000Z"
+    }
+]

@@ -6,17 +6,40 @@ from db_config import get_templates_collection
 def get_execution_order(template_keys: list, all_templates: dict = None) -> list:
     """
     Return a topologically sorted list of template keys based on dependencies.
-    Raises ValueError if a cycle is detected or dependency is missing.
+    Only considers templates in 'template_keys' and their recursive dependencies.
+    Raises ValueError if a dependency is missing or if those specific templates have a cycle.
     """
     source = all_templates if all_templates is not None else TEMPLATES
-    graph = {k: set(v.get("dependencies", [])) for k, v in source.items()}
     
-    in_degree = {k: 0 for k in graph}
-    for k in graph:
-        for dep in graph[k]:
-            if dep not in in_degree:
-                continue 
-            in_degree[k] += 1
+    # 1. Build the reachable set of templates (closure)
+    to_visit = set(template_keys)
+    visited = set()
+    reachable_graph = {}
+
+    while to_visit:
+        tk = to_visit.pop()
+        if tk in visited:
+            continue
+        visited.add(tk)
+        
+        tpl_def = source.get(tk)
+        if not tpl_def:
+            # If a requested template is missing, we can't sort properly
+            # but usually this is called with validated keys.
+            continue
+            
+        deps = set(tpl_def.get("dependencies", []))
+        reachable_graph[tk] = deps
+        for d in deps:
+            if d not in visited:
+                to_visit.add(d)
+
+    # 2. Kahn's Algorithm on the reachable graph only
+    in_degree = {k: 0 for k in reachable_graph}
+    for k in reachable_graph:
+        for dep in reachable_graph[k]:
+            if dep in in_degree:
+                in_degree[k] += 1
             
     queue = [k for k in in_degree if in_degree[k] == 0]
     sorted_list = []
@@ -25,15 +48,18 @@ def get_execution_order(template_keys: list, all_templates: dict = None) -> list
         node = queue.pop(0)
         sorted_list.append(node)
         
-        for k, deps in graph.items():
+        for k, deps in reachable_graph.items():
             if node in deps:
                 in_degree[k] -= 1
                 if in_degree[k] == 0:
                     queue.append(k)
                     
-    if len(sorted_list) != len(graph):
-        raise ValueError("Cyclic dependency detected in templates")
+    if len(sorted_list) != len(reachable_graph):
+        # Identify the remaining nodes with in-degree > 0 for better error message
+        remaining = [k for k, v in in_degree.items() if v > 0]
+        raise ValueError(f"Cyclic dependency detected involving templates: {remaining}")
         
+    # Return filter of the sorted list containing only the originally requested keys
     return [k for k in sorted_list if k in template_keys]
 
 def validate_template_dependencies():

@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Single-file backend for the CSV Data Import Tool (pruned, no DB).
 
@@ -17,6 +18,7 @@ import json
 import re
 import csv
 from datetime import datetime
+import sys
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -24,6 +26,7 @@ load_dotenv()
 import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from flasgger import Swagger
 import uuid
 import threading
 import time
@@ -37,8 +40,12 @@ from db_config import (
     get_ingestion_records_collection, 
     get_templates_collection, 
     get_webhooks_collection,
-    get_users_collection
+    get_users_collection,
+    get_header_aliases_collection,
+    get_api_keys_collection,
+    get_audit_logs_collection,
 )
+from api_keys import create_api_key, list_api_keys, revoke_api_key
 from auth_utils import (
     require_auth, 
     require_role, 
@@ -98,6 +105,33 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 app = Flask(__name__)
 CORS(app, supports_credentials=True, resources={r"/api/*": {"origins": "*"}})
 
+# Initialize Swagger with a custom template to avoid default /tos
+swagger_template = {
+    "info": {
+        "title": "CSV Data Import API",
+        "description": "API documentation for the CSV data importing tool.",
+        "version": "1.0.0"
+    },
+    "securityDefinitions": {
+        "Bearer": {
+            "type": "apiKey",
+            "name": "Authorization",
+            "in": "header",
+            "description": "Enter the token with the 'Bearer: ' prefix, e.g. 'Bearer sk_live_abc123'."
+        }
+    },
+    "security": [
+        {
+            "Bearer": []
+        }
+    ]
+}
+swagger = Swagger(app, template=swagger_template)
+
+@app.route('/favicon.ico')
+def favicon():
+    return '', 204
+
 
 # Register REST API Blueprint
 try:
@@ -118,7 +152,9 @@ except Exception as e:
 # Register GraphQL Endpoint
 try:
     from flask_graphql import GraphQLView
-    from schema_builder import schema
+    from schema_builder import build_schema
+    from db_config import get_templates_collection
+    from core_config import TEMPLATES as DEFAULT_TEMPLATES
     
     # Custom View to inject tenant_id from query params into context
     class CustomGraphQLView(GraphQLView):
@@ -130,17 +166,244 @@ try:
                 'tenant_id': request.args.get('tenantId')
             }
 
-    app.add_url_rule(
-        '/graphql',
-        view_func=CustomGraphQLView.as_view(
-            'graphql',
+    @app.route('/graphql', methods=['GET', 'POST'])
+    def graphql_endpoint():
+        tenant_id = request.args.get('tenantId')
+        if not tenant_id:
+            # If no tenant is provided, just use the defaults so the playground still loads
+            all_templates = {**DEFAULT_TEMPLATES}
+        else:
+            all_templates = {**DEFAULT_TEMPLATES}
+            coll = get_templates_collection()
+            if coll is not None:
+                custom = list(coll.find({"tenantId": tenant_id}))
+                for t in custom:
+                    all_templates[t["templateKey"]] = t
+                    
+        # Build schema for this tenant dynamically
+        schema = build_schema(all_templates)
+        
+        graphql_view = CustomGraphQLView.as_view(
+            f'graphql_view_{tenant_id or "default"}',
             schema=schema,
             graphiql=True # Enable GraphiQL interface
         )
-    )
+        return graphql_view()
+        
     print("Main: Registered GraphQL at /graphql")
 except Exception as e:
     print(f"Main: Failed to register GraphQL: {e}")
+
+# --------------------------------------------------------------------------
+# Webhook Test Endpoint
+# --------------------------------------------------------------------------
+
+@app.route("/api/webhooks/test", methods=["POST"])
+@require_auth
+def test_webhook():
+    """
+    Test a webhook URL with a mock payload.
+    ---
+    tags:
+      - Webhooks
+    parameters:
+      - in: body
+        name: body
+        schema:
+          type: object
+        required: true
+        description: Webhook config.
+    responses:
+      200:
+        description: Webhook tested successfully.
+    """
+    body = request.get_json(force=True, silent=False) or {}
+    url = body.get("url")
+    secret = body.get("secret", "")
+    tenant_id = body.get("tenantId", "test-tenant")
+    
+    if not url:
+        return jsonify({"error": "url is required"}), 400
+        
+    mock_payload = {
+        "event": "job.completed",
+        "tenantId": tenant_id,
+        "jobId": str(uuid.uuid4()),
+        "status": "completed",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "summary": {
+             "totalRows": 100,
+             "created": 95,
+             "errors": 5
+        }
+    }
+    
+    headers = {"Content-Type": "application/json"}
+    if secret:
+        # Include signature header if secret is provided
+        import hmac, hashlib, json
+        payload_bytes = json.dumps(mock_payload).encode('utf-8')
+        signature = hmac.new(secret.encode('utf-8'), payload_bytes, hashlib.sha256).hexdigest()
+        headers["X-Webhook-Signature"] = signature
+        
+    try:
+        resp = requests.post(url, json=mock_payload, headers=headers, timeout=5)
+        return jsonify({
+            "status_code": resp.status_code,
+            "response": resp.text[:500], # Limit response text
+            "success": 200 <= resp.status_code < 300
+        })
+    except requests.exceptions.RequestException as e:
+        return jsonify({
+            "status_code": 0,
+            "response": str(e),
+            "success": False
+        })
+
+# --------------------------------------------------------------------------
+# Audit Logs
+# --------------------------------------------------------------------------
+
+from audit_logger import log_audit_event
+
+@app.route("/api/audit-logs", methods=["GET"])
+@require_auth
+@require_role(ROLE_ADMIN)
+def get_audit_logs():
+    """
+    Get audit history for the tenant.
+    ---
+    tags:
+      - Audit
+    parameters:
+      - in: query
+        name: tenantId
+        type: string
+        required: true
+    responses:
+      200:
+        description: List of audit events.
+    """
+    tenant_id = request.args.get("tenantId")
+    if not tenant_id:
+        return jsonify({"error": "tenantId is required"}), 400
+        
+    limit = int(request.args.get("limit", 100))
+    coll = get_audit_logs_collection()
+    
+    if coll is None:
+        return jsonify({"logs": []})
+        
+    cursor = coll.find({"tenantId": tenant_id}).sort("timestamp", -1).limit(limit)
+    logs = []
+    
+    # We could join users collection but for now just return the user_id that took the action
+    
+    for doc in cursor:
+        doc["_id"] = str(doc["_id"])
+        if "timestamp" in doc:
+            doc["timestamp"] = doc["timestamp"].isoformat() + "Z"
+        logs.append(doc)
+        
+    return jsonify({"logs": logs})
+
+# --------------------------------------------------------------------------
+# API Key Endpoints
+# --------------------------------------------------------------------------
+
+@app.route("/api/keys", methods=["GET"])
+@require_auth
+def get_api_keys():
+    """
+    List all active API keys for a tenant.
+    ---
+    tags:
+      - API Keys
+    parameters:
+      - in: query
+        name: tenantId
+        type: string
+        required: true
+        description: The ID of the tenant.
+    responses:
+      200:
+        description: A list of API keys for the tenant.
+    """
+    tenant_id = request.args.get("tenantId")
+    if not tenant_id:
+        return jsonify({"error": "tenantId is required"}), 400
+        
+    keys = list_api_keys(tenant_id)
+    return jsonify({"keys": keys})
+
+@app.route("/api/keys", methods=["POST"])
+@require_auth
+def create_new_api_key():
+    """
+    Create a new API key for a tenant.
+    ---
+    tags:
+      - API Keys
+    parameters:
+      - in: body
+        name: body
+        schema:
+          type: object
+        required: true
+        description: Name for the new API key.
+    responses:
+      201:
+        description: API Key created successfully. Returns the raw key once.
+      400:
+        description: Invalid request.
+    """
+    body = request.get_json(force=True, silent=False) or {}
+    tenant_id = body.get("tenantId")
+    name = body.get("name")
+    
+    if not tenant_id or not name:
+        return jsonify({"error": "tenantId and name are required"}), 400
+        
+    user_id = get_current_user_id()
+    doc, error = create_api_key(tenant_id, user_id, name)
+    if error:
+        return jsonify({"error": error}), 500
+        
+    return jsonify({"message": "API Key created", "key": doc}), 201
+
+@app.route("/api/keys/<key_id>", methods=["DELETE"])
+@require_auth
+def delete_api_key(key_id):
+    """
+    Revoke an API key.
+    ---
+    tags:
+      - API Keys
+    parameters:
+      - in: path
+        name: key_id
+        type: string
+        required: true
+        description: The ID of the API key to revoke.
+      - in: query
+        name: tenantId
+        type: string
+        required: true
+        description: The ID of the tenant.
+    responses:
+      200:
+        description: API key revoked successfully.
+      404:
+        description: Key not found or revoke failed.
+    """
+    tenant_id = request.args.get("tenantId")
+    if not tenant_id:
+        return jsonify({"error": "tenantId is required"}), 400
+        
+    success = revoke_api_key(tenant_id, key_id)
+    if success:
+        return jsonify({"message": "API key revoked"})
+    return jsonify({"error": "Failed to revoke key"}), 400
 
 # --------------------------------------------------------------------------
 # Template + field metadata (with PII flags + schema hints)
@@ -172,6 +435,152 @@ def normalise_header_string(s: str) -> str:
     if not s:
         return ""
     return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def levenshtein_ratio(a: str, b: str) -> float:
+    """
+    Pure-Python normalised Levenshtein similarity in [0, 1].
+    1.0 = identical, 0.0 = completely different.
+    """
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    la, lb = len(a), len(b)
+    # Build the DP matrix inline (O(la*lb) time, O(min) space)
+    prev = list(range(lb + 1))
+    for i, ca in enumerate(a, 1):
+        curr = [i] + [0] * lb
+        for j, cb in enumerate(b, 1):
+            if ca == cb:
+                curr[j] = prev[j - 1]
+            else:
+                curr[j] = 1 + min(prev[j], curr[j - 1], prev[j - 1])
+        prev = curr
+    distance = prev[lb]
+    return 1.0 - distance / max(la, lb)
+
+
+def fuzzy_enum_match(value: str, allowed: list, threshold: float = 0.75) -> str | None:
+    """
+    Find the closest allowed enum value using Levenshtein similarity.
+    Returns the canonical value if similarity >= threshold, else None.
+    """
+    if not value or not allowed:
+        return None
+    vl = value.strip().lower()
+    best_ratio = 0.0
+    best_match = None
+    for a in allowed:
+        r = levenshtein_ratio(vl, a.lower())
+        if r > best_ratio:
+            best_ratio = r
+            best_match = a
+    return best_match if best_ratio >= threshold else None
+
+
+# ---------------------------------------------------------------------------
+# Jaro-Winkler — used exclusively for header matching (T4).
+# Better than Levenshtein for short strings: prefix-biased so
+# PatientID / PatentID scores higher than a symmetric edit distance would.
+# ---------------------------------------------------------------------------
+
+def jaro_winkler(s1: str, s2: str, p: float = 0.1) -> float:
+    """
+    Pure-Python Jaro-Winkler similarity in [0, 1].
+    p = scaling factor for prefix bonus (standard = 0.1).
+    """
+    if s1 == s2:
+        return 1.0
+    l1, l2 = len(s1), len(s2)
+    if l1 == 0 or l2 == 0:
+        return 0.0
+
+    match_dist = max(l1, l2) // 2 - 1
+    if match_dist < 0:
+        match_dist = 0
+
+    s1_matches = [False] * l1
+    s2_matches = [False] * l2
+    matches = 0
+    transpositions = 0
+
+    for i in range(l1):
+        start = max(0, i - match_dist)
+        end = min(i + match_dist + 1, l2)
+        for j in range(start, end):
+            if s2_matches[j] or s1[i] != s2[j]:
+                continue
+            s1_matches[i] = True
+            s2_matches[j] = True
+            matches += 1
+            break
+
+    if matches == 0:
+        return 0.0
+
+    k = 0
+    for i in range(l1):
+        if not s1_matches[i]:
+            continue
+        while not s2_matches[k]:
+            k += 1
+        if s1[i] != s2[k]:
+            transpositions += 1
+        k += 1
+
+    jaro = (matches / l1 + matches / l2 + (matches - transpositions / 2) / matches) / 3
+
+    # Winkler prefix bonus (up to 4 chars)
+    prefix = 0
+    for i in range(min(4, l1, l2)):
+        if s1[i] == s2[i]:
+            prefix += 1
+        else:
+            break
+
+    return jaro + prefix * p * (1 - jaro)
+
+
+# ---------------------------------------------------------------------------
+# Global synonym graph — Tier 3 of the waterfall.
+# Keys are normalised field identifiers; values are lists of normalised
+# uploaded-header variants that should map to that concept.
+# All values are already lowercase with non-alphanumerics stripped.
+# ---------------------------------------------------------------------------
+
+GLOBAL_SYNONYMS: dict[str, list[str]] = {
+    # Person identification
+    "id":           ["personid", "pid", "personno", "personnum", "no", "num", "number", "ref", "code"],
+    "firstname":    ["fname", "givenname", "forename", "first", "firstnm", "given"],
+    "surname":      ["lname", "lastname", "familyname", "last", "lastnm", "family", "secondname"],
+    "fullname":     ["name", "fullnm", "displayname"],
+    "dateofbirth":  ["dob", "birthdate", "bday", "birthday", "birthdt", "dateofbirth", "dobirthday"],
+    "dob":          ["dateofbirth", "birthdate", "bday", "birthday"],
+    "gender":       ["sex", "gend", "gndr"],
+    "title":        ["salutation", "prefix", "honorific"],
+    "email":        ["emailaddress", "mail", "emailid", "emailaddr", "eaddress"],
+    "phone":        ["phonenumber", "mobile", "cell", "tel", "telephone", "mob", "mobilenum"],
+    "type":         ["persontype", "emptype", "employeetype", "candidatetype", "workertype", "category"],
+    # Patient / clinical
+    "patientid":    ["candidateno", "candidatenum", "candidateid", "employeeid", "empid",
+                     "memberid", "personno", "pid", "patno", "patientno", "workerid"],
+    "assessmentdate": ["apptdate", "appointmentdate", "visitdate", "testdate", "examdate",
+                       "scheduleddate", "bookingdate", "assessdt"],
+    "assessmentname":  ["assessmenttype", "examtype", "testtype", "examname", "visittype",
+                        "appointmenttype", "programname", "programtype"],
+    "blockname":    ["block", "blocknum", "session", "cohort", "groupname"],
+    "tests":        ["testlist", "examination", "examinations", "testnames", "testsconducted"],
+    "status":       ["recordstatus", "currentstatus", "state", "processingstatus", "bookingstatus"],
+    "notes":        ["comments", "remarks", "clinicalnotes", "comment", "note", "observations"],
+    # Booking
+    "bookingref":   ["bookingno", "bookingnum", "refno", "refnum", "appointmentref",
+                     "appointmentno", "bookingid", "scheduleid"],
+    "personnumber": ["personno", "personnum", "empno", "employeeno", "candidateno",
+                     "candidatenum", "candidateid", "workerid", "individualno"],
+    "locationname": ["location", "clinic", "site", "venue", "address", "clinicname", "facilityname"],
+    "providername": ["provider", "doctor", "dr", "clinician", "specialist", "healthprovider"],
+}
 
 
 def is_valid_email(v: str) -> bool:
@@ -470,7 +879,73 @@ def clean_patient_value(field, raw):
     return clean_generic_string(raw, required)
 
 
-def clean_value(template_key: str, field: dict, raw, valid_ref_ids: dict = None):
+def clean_value_by_pattern(field: dict, raw) -> tuple:
+    """
+    Generic pattern-driven cleaner for ANY template field.
+    Uses field metadata (pattern, normalize, mask, allowed, etc.) so custom
+    templates get the same quality of cleaning as system templates.
+    Returns (clean_value, status) where status is 'ok' or 'bad'.
+    """
+    required = bool(field.get("required", False))
+    pattern = field.get("pattern", "string")
+    normalize = field.get("normalize", "")
+
+    if raw is None or str(raw).strip() == "":
+        return "", ("bad" if required else "ok")
+
+    s = str(raw).strip()
+
+    if pattern == "date":
+        parsed = parse_to_dd_mm_yyyy(s)
+        if not parsed:
+            return s, "bad"
+        return parsed, "ok"
+
+    if pattern == "integer":
+        return clean_numeric_id(raw, required)
+
+    if pattern == "email":
+        return clean_email(raw, required)
+
+    if pattern == "enum":
+        allowed = field.get("allowed") or []
+        if allowed:
+            # 1. Case-insensitive exact match
+            match = next((a for a in allowed if a.lower() == s.lower()), None)
+            if match:
+                return match, "ok"
+            # 2. Fuzzy nearest-enum repair
+            fuzzy = fuzzy_enum_match(s, allowed, threshold=0.72)
+            if fuzzy:
+                return fuzzy, "ok"
+            return s, ("bad" if not field.get("allowNew") else "ok")
+        return s, "ok"
+
+    # Default: string with optional normalisation
+    if normalize == "titlecase":
+        return to_title_case_name(s) or s, "ok"
+    if normalize == "uppercase" or field.get("mask") == "uppercase":
+        return s.upper(), "ok"
+    if normalize == "email":
+        return clean_email(raw, required)
+
+    return s, "ok"
+
+
+def _normalize_id(val) -> str:
+    """Helper to convert any ID (numeric/string) to a consistent lowercase string.
+    Strips non-digits to ensure IDs like 'e1005' match '1005' consistently.
+    """
+    if val is None:
+        return ""
+    s = str(val).strip().lower()
+    digits = re.sub(r"\D+", "", s)
+    if digits:
+        return digits
+    return s
+
+
+def clean_value(template_key: str, field: dict, raw, valid_ref_ids: dict = None, session_context: list = None, all_templates: dict = None):
     """
     Main entry point for cleaning and validating a single value.
     Enforces pattern matching (date, integer, enum) and template-specific rules.
@@ -496,8 +971,8 @@ def clean_value(template_key: str, field: dict, raw, valid_ref_ids: dict = None)
     elif template_key == "PatientData":
         res = clean_patient_value(field, raw)
     else:
-        required = bool(field.get("required", False))
-        res = clean_generic_string(raw, required)
+        # Custom templates: use generic pattern-driven cleaner instead of bare string clean
+        res = clean_value_by_pattern(field, raw)
 
     clean_val, status = res
     
@@ -629,11 +1104,36 @@ def clean_value(template_key: str, field: dict, raw, valid_ref_ids: dict = None)
 
         # --- RELATIONSHIP VALIDATION (FK existence check) ---
         if pattern == "relationship":
+            s_norm = _normalize_id(s) # Use the already cleaned 's'
             ref_set = (valid_ref_ids or {}).get(field["key"])
+            
             if ref_set is not None:
-                # ref_set was pre-fetched from DB; None means no context (skip check)
-                if s not in ref_set:
-                    return clean_val, "bad"  # FK violation: ID not found in parent collection
+                if s_norm in ref_set:
+                    return s_norm, "ok"
+                
+                # FALLBACK: Aggressive search in session context if not in pre-fetched set
+                if session_context:
+                    rel = field.get("relationship") or {}
+                    target_tpl_key = rel.get("targetTemplate")
+                    if target_tpl_key:
+                        for item in session_context:
+                            if item.get("templateKey") == target_tpl_key:
+                                t_rows = item.get("rows") or []
+                                try:
+                                    t_tpl = get_template(target_tpl_key, all_templates)
+                                    id_f = next((f["key"] for f in t_tpl["fields"] if f.get("identifier")), "id")
+                                    for r in t_rows:
+                                        if _normalize_id(r.get(id_f)) == s_norm:
+                                            print(f"CLEAN: Aggressive found {s_norm} in {target_tpl_key}")
+                                            sys.stdout.flush()
+                                            return s_norm, "ok"
+                                except:
+                                    continue
+                
+                print(f"CLEAN: {template_key}.{field['key']} FAILED to find ID '{s_norm}'")
+                sys.stdout.flush()
+                return clean_val, "bad"  # FK violation
+            return s_norm, "ok" # If ref_set is None, skip check and assume ok
 
     return clean_val, status
 
@@ -721,24 +1221,54 @@ def infer_sequential_numeric_ids(template_key: str, rows: list, all_templates: d
     return inferred
 
 
-def clean_rows_for_template(template_key: str, rows: list, all_templates: dict = None, tenant_id: str = None):
+def get_valid_ref_ids(template_key: str, all_templates: dict, tenant_id: str = None, session_context: list = None):
     """
-    Algorithmically clean + validate all rows for a given template.
-
-    rows: [ { "__rowIndex": 0, "<fieldKey>": value, ... }, ... ]
-
-    Returns:
-      cleaned_rows: list[dict]
-      row_errors: dict[rowIndex -> list[fieldKey]]
-      inferred_ids: list[...]
+    Collect all valid target IDs for relationship fields from both DB and session context.
+    Normalized strings are used for comparison.
     """
     tpl = get_template(template_key, all_templates)
-    refs = tpl.get("references", {})  # built by template_utils.get_templates()
-
-    # Pre-fetch valid IDs for each relationship field in one DB query per reference.
-    # valid_ref_ids: { field_key -> set of valid ID strings } or None if no DB context.
+    refs = tpl.get("references", {})
     valid_ref_ids = {}
-    if tenant_id and refs:
+
+    if not refs:
+        return {}
+
+    # 1. Collect IDs from session_context (in-memory)
+    session_ids_by_template = {}
+    if session_context:
+        for item in session_context:
+            t_key = item.get("templateKey")
+            t_rows = item.get("rows") or []
+            if t_key and t_rows:
+                try:
+                    t_tpl = get_template(t_key, all_templates)
+                    # Use provided identifier or fall back to 'id'
+                    id_field = next((f["key"] for f in t_tpl["fields"] if f.get("identifier")), "id")
+                    
+                    # Log for debug
+                    try:
+                        log_path = r"C:\Users\abrin\Desktop\debug_validation.txt"
+                        with open(log_path, "a") as f_log:
+                            f_log.write(f"CONTEXT: {t_key} rows={len(t_rows)} id_field={id_field}\n")
+                            found_ids = [_normalize_id(r.get(id_field)) for r in t_rows if r.get(id_field) is not None]
+                            if "1005" in found_ids:
+                                f_log.write(f"FOUND 1005 in {t_key} context!\n")
+                            else:
+                                f_log.write(f"1005 MISSING from {t_key} context. First 5 IDs: {found_ids[:5]}\n")
+                    except:
+                        pass
+
+                    session_ids_by_template[t_key] = {
+                        _normalize_id(r.get(id_field)) 
+                        for r in t_rows 
+                        if r.get(id_field) is not None
+                    }
+                except Exception as e:
+                    print(f"CLEAN: Error processing session context for {t_key}: {e}")
+                    continue
+
+    # 2. Collect IDs from DB
+    if tenant_id:
         try:
             from db_config import get_tenant_data_collection
             coll = get_tenant_data_collection()
@@ -748,20 +1278,39 @@ def clean_rows_for_template(template_key: str, rows: list, all_templates: dict =
                     target_field = ref_config.get("targetField", "id")
                     if not target_tpl:
                         continue
+                    
+                    # Fetch DB IDs
                     docs = coll.find(
                         {"tenantId": tenant_id, "templateKey": target_tpl},
                         {f"data.{target_field}": 1}
                     )
-                    valid_ref_ids[field_key] = {
-                        str(d["data"][target_field])
+                    ids = {
+                        _normalize_id(d["data"][target_field])
                         for d in docs
                         if "data" in d and target_field in d["data"]
                     }
-                    print(f"CLEAN: Pre-fetched {len(valid_ref_ids[field_key])} valid '{target_field}' IDs "
-                          f"from {target_tpl} for field '{field_key}'")
+                    
+                    # Merge with session IDs
+                    if target_tpl in session_ids_by_template:
+                        ids.update(session_ids_by_template[target_tpl])
+                        print(f"CLEAN: Merged {len(session_ids_by_template[target_tpl])} session IDs for '{target_tpl}'")
+
+                    valid_ref_ids[field_key] = ids
         except Exception as e:
-            print(f"CLEAN: Warning - could not pre-fetch ref IDs for {template_key}: {e}")
-            valid_ref_ids = {}  # Fall back: skip FK check rather than crash
+            print(f"CLEAN: Error pre-fetching ref IDs: {e}")
+
+    return valid_ref_ids
+
+
+def clean_rows_for_template(template_key: str, rows: list, all_templates: dict = None, tenant_id: str = None, session_context: list = None, valid_ref_ids: dict = None):
+    """
+    Algorithmically clean + validate all rows for a given template.
+    """
+    tpl = get_template(template_key, all_templates)
+    
+    # If not provided, fetch them (legacy support or first call)
+    if valid_ref_ids is None:
+        valid_ref_ids = get_valid_ref_ids(template_key, all_templates, tenant_id, session_context)
 
     cleaned_rows = []
     row_errors = {}
@@ -779,7 +1328,7 @@ def clean_rows_for_template(template_key: str, rows: list, all_templates: dict =
             fkey = field["key"]
             raw_val = row.get(fkey)
 
-            clean_val, status = clean_value(template_key, field, raw_val, valid_ref_ids=valid_ref_ids)
+            clean_val, status = clean_value(template_key, field, raw_val, valid_ref_ids=valid_ref_ids, session_context=session_context, all_templates=all_templates)
 
             # PatientData.blockName default
             if template_key == "PatientData" and fkey == "blockName" and not clean_val:
@@ -802,8 +1351,69 @@ def clean_rows_for_template(template_key: str, rows: list, all_templates: dict =
 # --------------------------------------------------------------------------
 # Header mapping helpers
 # --------------------------------------------------------------------------
-def compute_header_score(field: dict, header: str, all_templates: dict = None) -> float:
-    """Heuristic score for mapping a given uploaded header to a template field."""
+# -- date/email/int sample-value detectors used by header scoring --
+_DATE_RE = re.compile(
+    r"^\d{1,2}[\-/\.]\d{1,2}[\-/\.]\d{2,4}$|^\d{4}[\-/\.]\d{1,2}[\-/\.]\d{1,2}$"
+)
+_EMAIL_RE2 = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_INT_RE = re.compile(r"^-?\d+$")
+
+
+def _sample_value_bonus(field: dict, sample_values: list) -> float:
+    """
+    Extra score based on whether the actual data values in a CSV column
+    look like they belong to this field.
+    """
+    if not sample_values:
+        return 0.0
+    non_empty = [str(v).strip() for v in sample_values if v is not None and str(v).strip()]
+    if not non_empty:
+        return 0.0
+
+    pattern = field.get("pattern", "")
+    allowed = field.get("allowed") or []
+    bonus = 0.0
+    sample_n = len(non_empty)
+
+    if pattern == "date":
+        hits = sum(1 for v in non_empty if _DATE_RE.match(v))
+        bonus += 8.0 * (hits / sample_n)
+
+    elif pattern == "email":
+        hits = sum(1 for v in non_empty if _EMAIL_RE2.match(v))
+        bonus += 8.0 * (hits / sample_n)
+
+    elif pattern == "integer":
+        hits = sum(1 for v in non_empty if _INT_RE.match(v))
+        bonus += 5.0 * (hits / sample_n)
+
+    elif pattern == "enum" and allowed:
+        allowed_lower = {a.lower() for a in allowed}
+        hits = sum(
+            1 for v in non_empty
+            if v.lower() in allowed_lower or fuzzy_enum_match(v, allowed, threshold=0.8) is not None
+        )
+        bonus += 7.0 * (hits / sample_n)
+
+    return bonus
+
+
+def compute_header_score(field: dict, header: str, all_templates: dict = None,
+                         sample_values: list = None) -> float:
+    """Heuristic score for mapping a given uploaded header to a template field.
+
+    Signals (highest first):
+      +10  exact label match
+       +9  exact synonym match
+       +8  exact key match
+       +8  sample-value → enum hit rate
+       +8  sample-value → date/email hit rate
+       +6  fuzzy label/key match (Levenshtein ≥ 0.80)
+       +5  substring label in header (or vice-versa)
+       +5  sample-value → integer hit rate
+       +4  synonym substring overlap
+      +1.5 template keyword in header
+    """
     if not header:
         return 0.0
 
@@ -816,6 +1426,7 @@ def compute_header_score(field: dict, header: str, all_templates: dict = None) -
 
     score = 0.0
 
+    # --- Exact matches ---
     if hl == fl or normh == normfl:
         score += 10.0
     if hl == fk or normh == normfk:
@@ -823,86 +1434,272 @@ def compute_header_score(field: dict, header: str, all_templates: dict = None) -
     if fl in hl or hl in fl:
         score += 5.0
 
+    # --- Synonym matches ---
     for syn in field.get("synonyms", []) or []:
         sl = syn.lower()
         norms = normalise_header_string(syn)
         if hl == sl or normh == norms:
             score += 9.0
+            break  # already very confident, no need to keep adding
         elif sl in hl or hl in sl:
             score += 4.0
 
-    # small boost based on template keywords
-    # If all_templates is not provided, it falls back to global TEMPLATES in get_template
+    # --- Fuzzy distance (catches typos / CamelCase confusion) ---
+    if score < 8.0:  # only needed when exact match hasn't already won
+        best_fuzzy = max(
+            levenshtein_ratio(normh, normfl),
+            levenshtein_ratio(normh, normfk),
+        )
+        for syn in field.get("synonyms", []) or []:
+            best_fuzzy = max(best_fuzzy, levenshtein_ratio(normh, normalise_header_string(syn)))
+        if best_fuzzy >= 0.80:
+            score += 6.0 * best_fuzzy  # e.g. 0.85 → +5.1, 1.0 → +6.0
+
+    # --- Sample-value inference ---
+    score += _sample_value_bonus(field, sample_values or [])
+
+    # --- Template keyword boost ---
     try:
         kw_list = get_template(field["templateKey"], all_templates)["keywords"]
         for kw in kw_list:
             if kw in hl:
                 score += 1.5
-    except ValueError:
-        # If template not found (e.g. race condition or bad key), ignore keyword boost
+    except (ValueError, KeyError):
         pass
 
     return score
 
 
-def suggest_header_mappings(template_key: str, uploaded_headers: list, current_mapping: dict, all_templates: dict = None):
+def suggest_header_mappings(template_key: str, uploaded_headers: list, current_mapping: dict,
+                            all_templates: dict = None, sample_rows: list = None):
+    """Thin wrapper — delegates to the waterfall pipeline."""
+    return waterfall_header_match(
+        template_key=template_key,
+        uploaded_headers=uploaded_headers,
+        tenant_id=None,
+        current_mapping=current_mapping,
+        all_templates=all_templates,
+        sample_rows=sample_rows,
+    )
+
+
+def waterfall_header_match(
+    template_key: str,
+    uploaded_headers: list,
+    tenant_id: str,
+    current_mapping: dict = None,
+    all_templates: dict = None,
+    sample_rows: list = None,
+) -> list:
     """
-    Pure rule-based header mapping suggestion.
+    4-Tier Waterfall Header Matching Pipeline.
+
+    Each field passes through tiers in order and stops at the first match.
+    Tiers:
+      T1  Normalisation smash — strip all non-alphanumeric, lowercase, exact ==
+      T2  Tenant memory      — recall previously confirmed mappings from DB
+      T3  Global synonym graph — hardcoded B2B synonym dict
+      T4  Jaro-Winkler fuzzy  — typo tolerance, threshold 0.88
+
     Returns list of {templateKey, matchedHeader, confidence, source}.
     """
     tpl = get_template(template_key, all_templates)
     current_mapping = current_mapping or {}
-    used_headers = set(h for h in current_mapping.values() if h)
+    used_headers: set[str] = set(h for h in current_mapping.values() if h)
     mappings = []
 
+    # --- Pre-compute normalised header strings once ---
+    norm_uploaded: dict[str, str] = {h: normalise_header_string(h) for h in uploaded_headers}
+    # Reverse map: normalised -> original (for T1/T3 lookups)
+    norm_to_orig: dict[str, str] = {v: k for k, v in norm_uploaded.items()}
+
+    # --- T2: Load tenant aliases from DB once for this template ---
+    alias_lookup: dict[str, str] = {}   # fieldKey -> uploadedHeader (if known alias)
+    if tenant_id:
+        try:
+            coll = get_header_aliases_collection()
+            if coll is not None:
+                docs = coll.find({"tenantId": tenant_id, "templateKey": template_key})
+                for doc in docs:
+                    fk = doc.get("fieldKey")
+                    uh = doc.get("uploadedHeader")
+                    # Only useful if the header is present in this upload
+                    if fk and uh and uh in norm_uploaded:
+                        alias_lookup[fk] = uh
+        except Exception as e:
+            print(f"WATERFALL: T2 alias load error: {e}")
+
+    # --- T3: Build per-field synonym set from GLOBAL_SYNONYMS ---
+    # Allows both directions: field norm matches synonym, or synonym matches field norm
+    def _global_synonyms_for(field_norm: str) -> set[str]:
+        result = set()
+        # Direct lookup
+        for v in GLOBAL_SYNONYMS.get(field_norm, []):
+            result.add(v)
+        # Reverse: is this field norm a synonym of some other concept?
+        for concept, variants in GLOBAL_SYNONYMS.items():
+            if field_norm in variants:
+                result.add(concept)
+                result.update(variants)
+        return result
+
+    # --- Per-field waterfall ---
     for field in tpl["fields"]:
         fkey = field["key"]
-        base = {"templateKey": fkey, "matchedHeader": None, "confidence": 0.0, "source": "rule"}
+        fnorm = normalise_header_string(field.get("label", fkey))
+        fknorm = normalise_header_string(fkey)
+        field_synonyms_norm: set[str] = _global_synonyms_for(fnorm) | _global_synonyms_for(fknorm)
+        # Also add field-level synonyms defined in the template
+        for syn in (field.get("synonyms") or []):
+            field_synonyms_norm.add(normalise_header_string(syn))
 
+        base = {"templateKey": fkey, "matchedHeader": None, "confidence": 0.0, "source": "none"}
+
+        # Honour already-confirmed mapping
         existing = current_mapping.get(fkey)
-        if existing and existing in uploaded_headers:
+        if existing and existing in norm_uploaded:
             base["matchedHeader"] = existing
             base["confidence"] = 1.0
+            base["source"] = "existing"
             mappings.append(base)
             used_headers.add(existing)
             continue
 
-        best_score = 0.0
-        best_header = None
-        enriched_field = {**field, "templateKey": template_key}
+        matched_header = None
+        confidence = 0.0
+        source = "none"
 
-        for h in uploaded_headers:
+        # ---- TIER 1: Normalisation smash ----
+        # Check if any uploaded header, after stripping formatting, equals the field label or key
+        for h, hn in norm_uploaded.items():
             if h in used_headers:
                 continue
-            score = compute_header_score(enriched_field, h, all_templates)
-            if score > best_score:
-                best_score = score
-                best_header = h
+            if hn == fnorm or hn == fknorm:
+                matched_header = h
+                confidence = 1.0
+                source = "T1-norm"
+                break
 
-        if best_header and best_score >= 5.0:
-            base["matchedHeader"] = best_header
-            base["confidence"] = min(best_score / 10.0, 1.0)
-            used_headers.add(best_header)
+        # ---- TIER 2: Tenant memory ----
+        if not matched_header:
+            alias_h = alias_lookup.get(fkey)
+            if alias_h and alias_h not in used_headers:
+                matched_header = alias_h
+                confidence = 0.95
+                source = "T2-memory"
 
+        # ---- TIER 3: Global synonym graph ----
+        if not matched_header:
+            for h, hn in norm_uploaded.items():
+                if h in used_headers:
+                    continue
+                if hn in field_synonyms_norm:
+                    matched_header = h
+                    confidence = 0.85
+                    source = "T3-synonym"
+                    break
+
+        # ---- TIER 4: Jaro-Winkler fuzzy match ----
+        JW_THRESHOLD = 0.88
+        if not matched_header:
+            best_jw = 0.0
+            best_h = None
+            for h, hn in norm_uploaded.items():
+                if h in used_headers:
+                    continue
+                # T4 scores ONLY against the field's own label/key and template-defined synonyms.
+                # Global synonyms (field_synonyms_norm) are intentionally excluded here because
+                # T3 already handles exact synonym matches, and fuzzy-matching against a large
+                # synonym set causes prefix-coincidence false-positives
+                # (e.g. 'candidateid' ~ 'candidatetype' → wrongly matching Type field).
+                template_syn_norms = [normalise_header_string(s) for s in (field.get("synonyms") or [])]
+                jw = max(
+                    jaro_winkler(hn, fnorm),
+                    jaro_winkler(hn, fknorm),
+                    *(jaro_winkler(hn, s) for s in template_syn_norms) if template_syn_norms else (0.0,)
+                )
+                if jw > best_jw:
+                    best_jw = jw
+                    best_h = h
+            if best_h and best_jw >= JW_THRESHOLD:
+                matched_header = best_h
+                confidence = round(best_jw, 3)
+                source = "T4-fuzzy"
+
+        # ---- Fallback: sample-value scoring (last resort, non-waterfall) ----
+        if not matched_header and sample_rows:
+            header_samples = {}
+            for h in uploaded_headers:
+                vals = [r.get(h) for r in sample_rows[:10] if r.get(h) is not None]
+                if vals:
+                    header_samples[h] = vals
+
+            best_score = 0.0
+            best_h = None
+            enriched = {**field, "templateKey": template_key}
+            for h in uploaded_headers:
+                if h in used_headers:
+                    continue
+                score = _sample_value_bonus(enriched, header_samples.get(h, []))
+                if score > best_score:
+                    best_score = score
+                    best_h = h
+            if best_h and best_score >= 5.0:
+                matched_header = best_h
+                confidence = round(min(best_score / 10.0, 0.75), 3)
+                source = "T5-sample"
+
+        if matched_header:
+            print(f"WATERFALL: {source}: '{fkey}' → '{matched_header}' (conf={confidence})")
+            used_headers.add(matched_header)
+        else:
+            print(f"WATERFALL: no-match: '{fkey}' left unmapped")
+
+        base["matchedHeader"] = matched_header
+        base["confidence"] = confidence
+        base["source"] = source
         mappings.append(base)
 
     return mappings
 
 
-def detect_template_from_headers(headers: list, all_templates: dict = None) -> str:
-    """Lightweight heuristic to pick the most likely template based on headers."""
+def detect_template_from_headers(headers: list, all_templates: dict = None,
+                                  sample_rows: list = None) -> str:
+    """Heuristic to pick the most likely template based on headers + sample values."""
     detected_key = None
-    best_score = 0
-    
+    best_score = 0.0
+
     source = all_templates if all_templates is not None else TEMPLATES
 
+    # Build per-header samples once
+    header_samples: dict[str, list] = {}
+    if sample_rows:
+        for h in headers:
+            vals = [r.get(h) for r in sample_rows[:5] if r.get(h) is not None]
+            if vals:
+                header_samples[h] = vals
+
     for key, tpl in source.items():
-        score = 0
+        score = 0.0
         keywords = tpl.get("keywords") or []
+        fields = tpl.get("fields") or []
+
+        # 1. Keyword hit in header names
         for kw in keywords:
             for h in headers:
                 if kw in (h or "").lower():
-                    score += 1
+                    score += 1.0
+
+        # 2. Sample-value field type matches
+        for h in headers:
+            samples = header_samples.get(h, [])
+            if not samples:
+                continue
+            # Find best-scoring field in this template for this header
+            for field in fields:
+                enriched = {**field, "templateKey": key}
+                score += _sample_value_bonus(enriched, samples) * 0.3  # weighted contribution
+
         if score > best_score:
             best_score = score
             detected_key = key
@@ -1340,6 +2137,7 @@ def enhance_rows_with_ai(
     full_dataset_context: list = None,
     extras: dict = None,
     include_pii_in_ai: bool = True,
+    valid_ref_ids: dict = None,
 ):
     """
     Optional GPT pass using schema-driven prompt.
@@ -1544,7 +2342,12 @@ def enhance_rows_with_ai(
             val = row.get(fk)
             
             # Re-clean using the core logic to detect errors/invalid enums
-            clean_val, status = clean_value(template_key, f, val)
+            clean_val, status = clean_value(
+                template_key, f, val, 
+                valid_ref_ids=valid_ref_ids, 
+                session_context=full_dataset_context, 
+                all_templates=None # Will use local templates if needed? No, sebaiknya pass.
+            )
             
             # If invalid (status 'bad' means it failed pattern/enum check)
             if status == "bad":
@@ -1827,8 +2630,11 @@ def api_import_preview():
 
     mapped_rows = build_template_rows_from_csv(template_key, headers, data_rows, suggested_mapping, all_templates)
 
+    # Pre-fetch valid IDs
+    valid_ref_ids = get_valid_ref_ids(template_key, all_templates, tenant_id=tenant_id, session_context=full_dataset_context)
+
     # 1) algorithmic clean
-    cleaned_rows_initial, row_errors_initial, inferred_ids_initial = clean_rows_for_template(template_key, mapped_rows, all_templates)
+    cleaned_rows_initial, row_errors_initial, inferred_ids_initial = clean_rows_for_template(template_key, mapped_rows, all_templates, tenant_id=tenant_id, session_context=full_dataset_context, valid_ref_ids=valid_ref_ids)
 
     # 2) optional AI pass
     cleaned_rows = cleaned_rows_initial
@@ -1849,8 +2655,9 @@ def api_import_preview():
             settings=settings,
             full_dataset_context=full_dataset_context,
             extras=extras,
+            valid_ref_ids=valid_ref_ids
         )
-        cleaned_rows, row_errors, inferred_ids = clean_rows_for_template(template_key, cleaned_rows_ai)
+        cleaned_rows, row_errors, inferred_ids = clean_rows_for_template(template_key, cleaned_rows_ai, all_templates, tenant_id=tenant_id, session_context=full_dataset_context, valid_ref_ids=valid_ref_ids)
 
     if template_key == "PatientData":
         for r in cleaned_rows:
@@ -1888,7 +2695,7 @@ def api_header_mapping():
     current_mapping_list = data.get("currentMapping") or []
     use_ai = bool(data.get("useAi", True))
     tenant_id = data.get("tenantId")
-    
+
     # Extract enhanced data from frontend
     template_fields = data.get("templateFields")
     template_label = data.get("templateLabel")
@@ -1904,7 +2711,7 @@ def api_header_mapping():
     except ValueError as ex:
         return jsonify({"error": str(ex)}), 400
 
-    # normalise current mapping into dict[templateKey -> header or None]
+    # Normalise current mapping into dict[templateKey -> header or None]
     current_mapping: dict[str, str] = {}
     for m in current_mapping_list:
         if not isinstance(m, dict):
@@ -1914,19 +2721,34 @@ def api_header_mapping():
         if tkey:
             current_mapping[tkey] = h
 
-    # Always compute rule-based suggestions as a safety net / fallback
-    rule_mappings = suggest_header_mappings(template_key, uploaded_headers, current_mapping)
-    rule_by_key = {m["templateKey"]: m for m in rule_mappings}
-    
-    print(f"DEBUG: rule_mappings count: {len(rule_mappings)}")
-    # Log top 3 rule-based matches if any
-    top_rules = [m for m in rule_mappings if m.get("matchedHeader")]
-    if top_rules:
-        print(f"DEBUG: top rule-based matches: {top_rules[:3]}")
+    # Build sample_rows from sampleData (list of dicts) if provided
+    sample_rows_for_mapping = None
+    if sample_data and isinstance(sample_data, list) and len(sample_data) > 0 and isinstance(sample_data[0], dict):
+        sample_rows_for_mapping = sample_data
 
-    # If AI is disabled or no key configured, just return rule-based
+    # ---- Run the 4-tier waterfall (T1→T2→T3→T4) ----
+    waterfall_mappings = waterfall_header_match(
+        template_key=template_key,
+        uploaded_headers=uploaded_headers,
+        tenant_id=tenant_id,
+        current_mapping=current_mapping,
+        all_templates=all_templates,
+        sample_rows=sample_rows_for_mapping,
+    )
+    waterfall_by_key = {m["templateKey"]: m for m in waterfall_mappings}
+
+    matched_count = sum(1 for m in waterfall_mappings if m.get("matchedHeader"))
+    print(f"WATERFALL: {matched_count}/{len(waterfall_mappings)} fields matched for {template_key}")
+
+    # If AI is disabled, no key configured, or waterfall already got ≥80% confidence → skip AI
     if not (use_ai and OPENAI_API_KEY):
-        return jsonify({"mappings": rule_mappings, "aiUsage": None})
+        return jsonify({"mappings": waterfall_mappings, "aiUsage": None})
+
+    total_fields = len(waterfall_mappings)
+    high_conf = [m for m in waterfall_mappings if m.get("matchedHeader") and m.get("confidence", 0) >= 0.5]
+    if total_fields > 0 and len(high_conf) / total_fields >= 0.80:
+        print(f"WATERFALL: Skipping AI — {len(high_conf)}/{total_fields} fields already high-confidence")
+        return jsonify({"mappings": waterfall_mappings, "aiUsage": None})
 
     # Build enhanced prompt with enum values and sample data
     prompt = build_header_prompt(
@@ -1939,9 +2761,8 @@ def api_header_mapping():
         sample_data=sample_data,
         all_templates=all_templates
     )
-    
-    print(f"DEBUG: api_header_mapping generated prompt for {template_key}")
-    # print(f"DEBUG Prompt:\n{prompt}") # Uncomment if deep inspection is needed
+
+    print(f"DEBUG: api_header_mapping calling AI for {template_key} ({total_fields - len(high_conf)} unmapped fields)")
 
     parsed, usage = call_openai_chat(prompt, call_type="header-mapping", tenant_id=tenant_id, job_id=None)
 
@@ -1971,11 +2792,12 @@ def api_header_mapping():
                 matched = None
                 conf = 0.0
 
-            rule_m = rule_by_key.get(fk)
-            if (not matched or conf < 0.5) and rule_m and rule_m.get("matchedHeader"):
-                matched = rule_m["matchedHeader"]
-                conf = max(conf, float(rule_m.get("confidence", 0.0)))
-                source = "rule-fallback"
+            # Prefer waterfall result if AI is unconfident
+            wfall_m = waterfall_by_key.get(fk)
+            if (not matched or conf < 0.5) and wfall_m and wfall_m.get("matchedHeader"):
+                matched = wfall_m["matchedHeader"]
+                conf = max(conf, float(wfall_m.get("confidence", 0.0)))
+                source = f"waterfall-fallback({wfall_m.get('source','rule')})"
             else:
                 source = "ai" if matched else "ai-none"
 
@@ -1994,10 +2816,270 @@ def api_header_mapping():
                 "estimatedCost": estimate_cost_from_usage(usage),
             }
 
-    print(f"DEBUG: api_header_mapping returning {len(final_mappings)} mappings")
-    # print(f"Mappings: {final_mappings}")
+    if not final_mappings:
+        final_mappings = waterfall_mappings
 
+    print(f"DEBUG: api_header_mapping returning {len(final_mappings)} mappings")
     return jsonify({"mappings": final_mappings, "aiUsage": ai_usage_summary})
+
+
+@app.route("/api/import/save-header-aliases", methods=["POST"])
+def api_save_header_aliases():
+    """
+    Tier-2 Tenant Memory: persist confirmed header→field mappings.
+    Called fire-and-forget from the frontend after a successful import confirm.
+
+    Body: { tenantId, aliases: [{ templateKey, fieldKey, uploadedHeader }] }
+    """
+    data = request.get_json(force=True, silent=False) or {}
+    tenant_id = data.get("tenantId")
+    aliases = data.get("aliases") or []
+
+    if not tenant_id:
+        return jsonify({"error": "tenantId required"}), 400
+    if not aliases:
+        return jsonify({"saved": 0})
+
+    try:
+        coll = get_header_aliases_collection()
+        if coll is None:
+            return jsonify({"error": "DB unavailable"}), 503
+
+        saved = 0
+        for a in aliases:
+            tpl_key = a.get("templateKey")
+            field_key = a.get("fieldKey")
+            uploaded_header = a.get("uploadedHeader")
+            if not (tpl_key and field_key and uploaded_header):
+                continue
+            try:
+                coll.update_one(
+                    {
+                        "tenantId": tenant_id,
+                        "templateKey": tpl_key,
+                        "fieldKey": field_key,
+                        "uploadedHeader": uploaded_header,
+                    },
+                    {"$set": {"tenantId": tenant_id, "templateKey": tpl_key,
+                              "fieldKey": field_key, "uploadedHeader": uploaded_header,
+                              "confirmedAt": __import__("datetime").datetime.utcnow()}},
+                    upsert=True,
+                )
+                saved += 1
+            except Exception:
+                pass  # duplicate or write error — non-fatal
+
+        print(f"WATERFALL T2: Saved {saved} header aliases for tenant {tenant_id}")
+        return jsonify({"saved": saved})
+
+    except Exception as e:
+        print(f"ERROR: save-header-aliases: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/header-aliases", methods=["GET"])
+def api_list_header_aliases():
+    """
+    List all saved T2 header aliases for a tenant.
+    Returns aliases grouped by templateKey.
+    Query params: ?tenantId=...
+    """
+    tenant_id = request.args.get("tenantId")
+    if not tenant_id:
+        return jsonify({"error": "tenantId required"}), 400
+    try:
+        coll = get_header_aliases_collection()
+        if coll is None:
+            return jsonify({"error": "DB unavailable"}), 503
+        docs = list(coll.find(
+            {"tenantId": tenant_id},
+            {"_id": 0, "tenantId": 0}
+        ).sort([("templateKey", 1), ("fieldKey", 1)]))
+        # Convert datetime to ISO string for JSON serialisation
+        for d in docs:
+            if "confirmedAt" in d and hasattr(d["confirmedAt"], "isoformat"):
+                d["confirmedAt"] = d["confirmedAt"].isoformat()
+        return jsonify({"aliases": docs})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/header-aliases", methods=["DELETE"])
+def api_delete_header_alias():
+    """
+    Delete a single T2 header alias.
+    Body: { tenantId, templateKey, fieldKey, uploadedHeader }
+    """
+    data = request.get_json(force=True, silent=False) or {}
+    tenant_id  = data.get("tenantId")
+    tpl_key    = data.get("templateKey")
+    field_key  = data.get("fieldKey")
+    uploaded_h = data.get("uploadedHeader")
+
+    if not all([tenant_id, tpl_key, field_key, uploaded_h]):
+        return jsonify({"error": "tenantId, templateKey, fieldKey, uploadedHeader all required"}), 400
+    try:
+        coll = get_header_aliases_collection()
+        if coll is None:
+            return jsonify({"error": "DB unavailable"}), 503
+        result = coll.delete_one({
+            "tenantId": tenant_id,
+            "templateKey": tpl_key,
+            "fieldKey": field_key,
+            "uploadedHeader": uploaded_h,
+        })
+        if result.deleted_count == 0:
+            return jsonify({"error": "Alias not found"}), 404
+        return jsonify({"deleted": 1})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/jobs/<job_id>/export-errors", methods=["GET"])
+def api_export_job_errors(job_id):
+    """
+    Download a CSV of all rows that failed validation/processing for a job.
+    Each row has the original data fields plus an __error column.
+    Query params: ?tenantId=...
+    """
+    import csv
+    import io
+    tenant_id = request.args.get("tenantId")
+    if not tenant_id:
+        return jsonify({"error": "tenantId required"}), 400
+    try:
+        coll_records = get_ingestion_records_collection()
+        coll_jobs    = get_ingestion_jobs_collection()
+        if coll_records is None:
+            return jsonify({"error": "DB unavailable"}), 503
+
+        # Security: ensure job belongs to tenant
+        job = coll_jobs.find_one({"jobId": job_id, "tenantId": tenant_id}) if coll_jobs is not None else None
+        if job is None:
+            return jsonify({"error": "Job not found"}), 404
+
+        error_docs = list(coll_records.find(
+            {"jobId": job_id, "status": "error"},
+            {"_id": 0, "data": 1, "error": 1, "rowIndex": 1, "templateKey": 1}
+        ).sort("rowIndex", 1))
+
+        if not error_docs:
+            return jsonify({"error": "No error rows for this job"}), 404
+
+        # Build unified column set
+        all_keys = []
+        seen_keys = set()
+        for doc in error_docs:
+            for k in (doc.get("data") or {}).keys():
+                if k not in seen_keys:
+                    all_keys.append(k)
+                    seen_keys.add(k)
+
+        output = io.StringIO()
+        writer = csv.DictWriter(
+            output,
+            fieldnames=["__rowIndex", "__template", "__error"] + all_keys,
+            extrasaction="ignore"
+        )
+        writer.writeheader()
+        for doc in error_docs:
+            row = {
+                "__rowIndex": doc.get("rowIndex", ""),
+                "__template": doc.get("templateKey", ""),
+                "__error":    doc.get("error", ""),
+                **(doc.get("data") or {}),
+            }
+            writer.writerow(row)
+
+        csv_bytes = output.getvalue().encode("utf-8")
+        short_id = job_id[:8]
+        return app.response_class(
+            csv_bytes,
+            mimetype="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=errors_{short_id}.csv"}
+        )
+    except Exception as e:
+        print(f"ERROR: export-errors: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/jobs/<job_id>/rollback", methods=["POST"])
+def api_rollback_job(job_id):
+    """
+    Roll back a completed job:
+      - DELETE tenant_data records where jobId = job_id AND __operation = "created"
+      - CLEAR jobId tag from records where __operation = "updated" (data change cannot be undone)
+      - Mark ingestion_records as rolled_back
+      - Mark job as rolled_back
+
+    Body: { tenantId }
+    Returns: { deleted, cleared, warning }
+    """
+    from datetime import datetime as _dt
+    data = request.get_json(force=True, silent=False) or {}
+    tenant_id = data.get("tenantId")
+    if not tenant_id:
+        return jsonify({"error": "tenantId required"}), 400
+
+    try:
+        coll_jobs    = get_ingestion_jobs_collection()
+        coll_records = get_ingestion_records_collection()
+        coll_data    = get_tenant_data_collection()
+
+        if not all([coll_jobs, coll_records, coll_data]):
+            return jsonify({"error": "DB unavailable"}), 503
+
+        # Verify job belongs to this tenant and is in a rollback-able state
+        job = coll_jobs.find_one({"jobId": job_id, "tenantId": tenant_id})
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+        if job.get("status") not in ("completed", "error"):
+            return jsonify({"error": f"Cannot roll back a job with status '{job.get('status')}'"}), 409
+
+        # 1. Delete records that were CREATED by this job
+        del_result = coll_data.delete_many({
+            "tenantId": tenant_id,
+            "jobId": job_id,
+            "__operation": "created",
+        })
+        deleted = del_result.deleted_count
+
+        # 2. Clear jobId from records that were UPDATED (data can't be restored)
+        upd_result = coll_data.update_many(
+            {"tenantId": tenant_id, "jobId": job_id, "__operation": "updated"},
+            {"$unset": {"jobId": ""}, "$set": {"__rollbackNote": f"Updated by rolled-back job {job_id}"}},
+        )
+        cleared = upd_result.modified_count
+
+        # 3. Mark ingestion_records as rolled_back
+        coll_records.update_many(
+            {"jobId": job_id},
+            {"$set": {"status": "rolled_back"}}
+        )
+
+        # 4. Mark job as rolled_back
+        coll_jobs.update_one(
+            {"_id": job["_id"]},
+            {"$set": {
+                "status": "rolled_back",
+                "rolledBackAt": _dt.utcnow(),
+                "rollbackSummary": {"deleted": deleted, "cleared": cleared},
+            }}
+        )
+
+        warning = None
+        if cleared > 0:
+            warning = (
+                f"{cleared} record(s) were updates to existing data and cannot be fully reversed. "
+                "Their jobId tag has been cleared but the data changes remain."
+            )
+
+        print(f"ROLLBACK: Job {job_id} — deleted {deleted} created records, cleared {cleared} updated records")
+        return jsonify({"deleted": deleted, "cleared": cleared, "warning": warning})
+
+    except Exception as e:
+        print(f"ERROR: rollback: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 def detect_templates_with_ai(headers: list, sample_data: list, tenant_id: str, all_templates: dict = None) -> list:
@@ -2294,9 +3376,12 @@ def api_clean_values():
     except ValueError as ex:
         return jsonify({"error": str(ex)}), 400
 
-    # 1) algorithmic clean (with FK relationship validation against tenant DB)
+    # Pre-fetch valid IDs for relationship validation
+    valid_ref_ids = get_valid_ref_ids(template_key, all_templates, tenant_id=tenant_id, session_context=full_dataset_context)
+
+    # 1) algorithmic clean
     cleaned_rows_initial, row_errors_initial, inferred_ids_initial = clean_rows_for_template(
-        template_key, rows, all_templates, tenant_id=tenant_id
+        template_key, rows, all_templates, tenant_id=tenant_id, session_context=full_dataset_context, valid_ref_ids=valid_ref_ids
     )
 
     # 2) AI pass (optional)
@@ -2322,7 +3407,7 @@ def api_clean_values():
             include_pii_in_ai=include_pii_in_ai,
         )
         cleaned_rows, row_errors, inferred_ids = clean_rows_for_template(
-            template_key, cleaned_rows_ai, all_templates, tenant_id=tenant_id
+            template_key, cleaned_rows_ai, all_templates, tenant_id=tenant_id, session_context=full_dataset_context, valid_ref_ids=valid_ref_ids
         )
 
     if template_key == "PatientData":
@@ -2447,8 +3532,12 @@ def api_import_trigger_job():
         single_id = body.get("uploadId")
         if single_id:
             upload_ids = [single_id]
-    
+
     tenant_id = body.get("tenantId")
+    
+    print(f"DEBUG: api_import_trigger_job called for tenant {tenant_id}")
+    # Force reload
+    print(f"DEBUG: uploadIds requested: {upload_ids}")
 
     if not upload_ids or not isinstance(upload_ids, list):
         return jsonify({"error": "uploadIds list is required"}), 400
@@ -2490,7 +3579,11 @@ def api_import_trigger_job():
         execution_order = get_execution_order(affected_templates, all_templates)
         print(f"DEBUG: TriggerJob - Execution Order: {execution_order}")
     except ValueError as e:
+        print(f"DEBUG: Dependency Sorting ERROR: {e}")
         return jsonify({"error": f"Dependency Cycle: {e}"}), 400
+    except Exception as e:
+        print(f"DEBUG: Unexpected error in get_execution_order: {e}")
+        return jsonify({"error": f"Internal sorting error: {e}"}), 500
 
     stages = {}
     for t_key in execution_order:

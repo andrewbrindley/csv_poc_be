@@ -93,3 +93,39 @@ def get_users_collection():
     if db is None:
         return None
     return db["users"]
+
+def get_header_aliases_collection():
+    """
+    Get the header_aliases collection for Tier-2 tenant memory.
+    Each document: { tenantId, templateKey, fieldKey, uploadedHeader }
+    A compound unique index on (tenantId, templateKey, fieldKey, uploadedHeader)
+    is created lazily on first use.
+    """
+    db = get_db()
+    if db is None:
+        return None
+    coll = db["header_aliases"]
+    # Ensure index exists (no-op if already present)
+    try:
+        coll.create_index(
+            [("tenantId", 1), ("templateKey", 1), ("fieldKey", 1), ("uploadedHeader", 1)],
+            unique=True,
+            background=True,
+        )
+    except Exception:
+        pass
+    return coll
+
+def get_api_keys_collection():
+    """Get the api_keys collection."""
+    db = get_db()
+    if db is None:
+        return None
+    return db["api_keys"]
+
+def get_audit_logs_collection():
+    """Get the audit_logs collection."""
+    db = get_db()
+    if db is None:
+        return None
+    return db["audit_logs"]

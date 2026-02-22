@@ -4,7 +4,8 @@ from datetime import datetime
 from db_config import get_tenant_data_collection, get_templates_collection
 from bson import ObjectId
 import re
-from auth_utils import require_role, ROLE_VIEWER, ROLE_EDITOR
+from auth_utils import require_role, ROLE_VIEWER, ROLE_EDITOR, get_current_user_id
+from audit_logger import log_audit_event
 
 # Fallback templates from main (circular import avoidance: we might need to refactor if main imports this)
 # Better to pass distinct templates or import from a shared module.
@@ -53,6 +54,38 @@ def resolve_template_key(tenant_id, resource_name):
 @data_bp.route("/<tenant_id>/<resource_name>", methods=["GET"])
 @require_role(ROLE_VIEWER)
 def list_resources(tenant_id, resource_name):
+    """
+    List resources of a specific type (template).
+    ---
+    tags:
+      - Data
+    parameters:
+      - in: path
+        name: tenant_id
+        type: string
+        required: true
+        description: The ID of the tenant.
+      - in: path
+        name: resource_name
+        type: string
+        required: true
+        description: The resource name (e.g., people, bookings).
+      - in: query
+        name: limit
+        type: integer
+        required: false
+        description: Max number of records to return.
+      - in: query
+        name: skip
+        type: integer
+        required: false
+        description: Number of records to skip.
+    responses:
+      200:
+        description: A list of resources.
+      404:
+        description: Resource not found.
+    """
     template_key, tpl_def = resolve_template_key(tenant_id, resource_name)
     if not template_key:
         return jsonify({"error": f"Resource '{resource_name}' not found"}), 404
@@ -126,6 +159,33 @@ def list_resources(tenant_id, resource_name):
 @data_bp.route("/<tenant_id>/<resource_name>/<id>", methods=["GET"])
 @require_role(ROLE_VIEWER)
 def get_resource(tenant_id, resource_name, id):
+    """
+    Get a specific resource by ID.
+    ---
+    tags:
+      - Data
+    parameters:
+      - in: path
+        name: tenant_id
+        type: string
+        required: true
+        description: The ID of the tenant.
+      - in: path
+        name: resource_name
+        type: string
+        required: true
+        description: The resource name.
+      - in: path
+        name: id
+        type: string
+        required: true
+        description: The ID of the specific resource.
+    responses:
+      200:
+        description: The requested resource.
+      404:
+        description: Resource not found.
+    """
     template_key, _ = resolve_template_key(tenant_id, resource_name)
     if not template_key:
         return jsonify({"error": f"Resource '{resource_name}' not found"}), 404
@@ -164,6 +224,34 @@ def get_resource(tenant_id, resource_name, id):
 @data_bp.route("/<tenant_id>/<resource_name>", methods=["POST"])
 @require_role(ROLE_EDITOR)
 def create_resource(tenant_id, resource_name):
+    """
+    Create a new resource of a specific type.
+    ---
+    tags:
+      - Data
+    parameters:
+      - in: path
+        name: tenant_id
+        type: string
+        required: true
+        description: The ID of the tenant.
+      - in: path
+        name: resource_name
+        type: string
+        required: true
+        description: The resource name.
+      - in: body
+        name: body
+        schema:
+          type: object
+        required: true
+        description: The data to create.
+    responses:
+      201:
+        description: Resource created successfully.
+      404:
+        description: Resource not found.
+    """
     template_key, tpl_def = resolve_template_key(tenant_id, resource_name)
     if not template_key:
         return jsonify({"error": f"Resource '{resource_name}' not found"}), 404
@@ -182,10 +270,13 @@ def create_resource(tenant_id, resource_name):
     }
     
     res = coll_data.insert_one(new_doc)
+    doc_id = str(res.inserted_id)
+    
+    log_audit_event(tenant_id, get_current_user_id(), "RESOURCE_CREATED", doc_id, {"templateKey": template_key})
     
     return jsonify({
-        "id": str(res.inserted_id),
+        "id": doc_id,
         "message": "Resource created",
-        "link": f"/api/v1/{tenant_id}/{resource_name}/{str(res.inserted_id)}"
+        "link": f"/api/v1/{tenant_id}/{resource_name}/{doc_id}"
     }), 201
 

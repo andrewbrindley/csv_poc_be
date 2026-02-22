@@ -8,6 +8,7 @@ Provides decorators to enforce RBAC based on the X-User-ID header.
 from functools import wraps
 from flask import request, jsonify
 from db_config import get_users_collection
+from api_keys import authenticate_api_key
 
 # Roles
 ROLE_ADMIN = "ADMIN"
@@ -25,8 +26,19 @@ ROLE_HIERARCHY = {
 }
 
 def get_current_user_id():
-    """Helper to extract user ID from headers."""
-    return request.headers.get("X-User-ID")
+    """Helper to extract user ID from headers, query params, or API key."""
+    # Check for API Key in Authorization header
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        token = auth_header.split(" ", 1)[1]
+        if token.startswith("sk_live_"):
+            key_data = authenticate_api_key(token)
+            if key_data:
+                # Store API key info in request context
+                request.api_key_data = key_data
+                return key_data["userId"]
+
+    return request.headers.get("X-User-ID") or request.args.get("userId")
 
 def get_user_from_db(user_id):
     """Fetch user document from MongoDB."""
@@ -58,6 +70,7 @@ def require_auth(f):
     def decorated_function(*args, **kwargs):
         user_id = get_current_user_id()
         if not user_id:
+            print("AUTH FAILED. Headers received:", dict(request.headers))
             return jsonify({"error": "Authentication required (missing X-User-ID header)"}), 401
         
         user = get_user_from_db(user_id)
@@ -90,11 +103,18 @@ def require_role(required_roles):
             
             # Extract tenantId from context (path kwargs, query, or body)
             tenant_id = kwargs.get("tenant_id") or request.args.get("tenantId")
-            if not tenant_id and request.is_json:
-                tenant_id = request.get_json(force=True, silent=True).get("tenantId")
+            if not tenant_id:
+                body = request.get_json(force=True, silent=True)
+                if body and isinstance(body, dict):
+                    tenant_id = body.get("tenantId")
             
             if not tenant_id:
                 return jsonify({"error": "tenantId context required for role check"}), 400
+
+            # If using an API key, verify the key explicitly belongs to this tenant
+            if hasattr(request, "api_key_data"):
+                if request.api_key_data["tenantId"] != tenant_id:
+                    return jsonify({"error": f"API key is not valid for tenant '{tenant_id}'"}), 403
 
             user_role = get_user_role_for_tenant(user, tenant_id)
             
